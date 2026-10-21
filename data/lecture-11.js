@@ -1,0 +1,991 @@
+window.PAGE = {
+ "num": 11,
+ "title": "Compiler Optimisation and Perf Tuning",
+ "summary": "How the compiler turns C++ into fast machine code: optimisation levels, inlining, unrolling and SIMD vectorisation, constexpr lookup tables, and the micro-optimisations that remove copies, virtual calls and mispredicted branches. Then how to measure honestly with std::chrono, gprof and perf, and the measure, find hot spot, optimise, re-measure loop.",
+ "notes": [
+  {
+   "heading": "Why the compiler is your biggest performance tool",
+   "body": "The C++ standard only specifies **observable behaviour** (volatile accesses, I/O, the final program output). Under the **as-if rule** the compiler may reorder, merge, delete or vectorise anything else as long as a correct (UB-free) program cannot tell the difference. That is why the same source can run 10-100x faster at `-O2` than at `-O0`.\n\n**In class:** in the first lecture we benchmarked a C++ program against a Java one. Both did 100 million calls to `sendOrder()`, which increments a global `volatile long counter`:\n\n```cpp\nvolatile long counter = 0;\nvoid sendOrder() { counter = counter + 1; }   // volatile: real load + real store each time\n\nint main() {\n    int num_of_orders = 1000'000'00;            // 100,000,000 (digit separators)\n    for (int i = 0; i < num_of_orders; i++) sendOrder();\n}\n```\n\n- `volatile` tells the compiler every read and write of `counter` is observable, so it **must** do one load and one store per iteration. Without it, `-O2` inlines `sendOrder()` and folds the whole loop into a single `counter += 100000000` (one add, zero iterations).\n- So `volatile` was there to keep the benchmark *honest*: we measure real work, not an empty loop.\n- C++ wins mostly at startup and predictability: native code, no VM start, no JIT warm-up, no GC. After warm-up, Java's JIT can produce similar machine code for a loop this simple.\n- Note: Java `volatile` and C++ `volatile` are different. In Java it gives cross-thread visibility and ordering; in C++ it gives **no** atomicity and **no** inter-thread ordering. For threads in C++ use `std::atomic`."
+  },
+  {
+   "heading": "Optimisation levels: -O0, -O1, -O2, -O3, -Os, -Ofast",
+   "body": "| Flag | What you get | Use it for |\n|---|---|---|\n| `-O0` | No optimisation; every variable lives in memory; best for the debugger | Debugging only, never benchmark at -O0 |\n| `-O1` | Basic: constant propagation, dead-code elimination, simple register allocation | Quick builds |\n| `-O2` | Almost everything that does not trade size for speed: inlining, CSE, loop-invariant code motion, strength reduction, scheduling, devirtualisation; GCC 12+ also does cheap vectorisation | The default release level |\n| `-O3` | `-O2` + aggressive inlining, loop unswitching, loop peeling / full unrolling of small loops, full auto-vectorisation, function cloning | Numeric / hot loops (measure: can bloat code) |\n| `-Os` / `-Oz` | Optimise for size | Embedded, I-cache bound code |\n| `-Ofast` | `-O3` + `-ffast-math` (breaks strict IEEE: assumes no NaN/Inf, reassociates FP) | Only when you accept different FP results |\n\nOther flags that matter in low latency:\n\n- `-march=native` lets the compiler use every instruction set of *this* CPU (AVX2, AVX-512, BMI2). The binary can crash with *illegal instruction* on an older machine.\n- `-flto` (link-time optimisation) lets the compiler inline across `.cpp` files.\n- **PGO**: `-fprofile-generate`, run a realistic workload, then `-fprofile-use`. The compiler learns which branches are hot, lays out code accordingly and unrolls the right loops. Often 10-20 % on branchy code.\n- `-fno-exceptions` / `-fno-rtti` are sometimes used in HFT codebases to shrink code.\n- Inspect what happened with `-S`, `objdump -d`, Compiler Explorer, and GCC's `-fopt-info-vec-missed`."
+  },
+  {
+   "heading": "Inlining",
+   "body": "Inlining copies the body of the callee into the caller. The direct win is small (no call/ret, no argument shuffling, ~1-5 ns saved), but the **indirect win is big**: once the body is visible the compiler can constant-fold, hoist, vectorise and remove dead branches across the old call boundary.\n\n```cpp\ninline int tick_to_price(int ticks) { return ticks * 5; }   // small, hot: perfect inline candidate\n\nfor (int i = 0; i < n; ++i) out[i] = tick_to_price(in[i]);\n// after inlining at -O3: a vectorised loop multiplying 8 ints per AVX2 instruction\n```\n\nKey facts:\n\n- The `inline` **keyword** today mainly means \"this definition may appear in several translation units\" (ODR exemption, needed for functions defined in headers). The optimiser treats it as a weak hint at most.\n- The compiler decides by cost models. Force it with `__attribute__((always_inline))` / `[[gnu::always_inline]]`; prevent it with `__attribute__((noinline))` (useful to keep cold code out of the hot path).\n- Functions defined inside a class body are implicitly `inline`.\n- Cannot inline: calls through a function pointer or a virtual call the compiler cannot devirtualise, or a body in another `.cpp` without LTO.\n- Cost of over-inlining: code bloat, more I-cache and iTLB misses. Hot paths should be small and tight."
+  },
+  {
+   "heading": "Loop unrolling, vectorisation and SIMD",
+   "body": "**Loop unrolling** does several iterations per loop trip: fewer compare/branch instructions, more independent work for the out-of-order core.\n\n```cpp\n// conceptually, unrolled by 4\nfor (i = 0; i + 4 <= n; i += 4) { s0 += a[i]; s1 += a[i+1]; s2 += a[i+2]; s3 += a[i+3]; }\nfor (; i < n; ++i) s0 += a[i];      // remainder (epilogue)\n```\n\n**Vectorisation (SIMD)** uses one instruction on several values: SSE = 128-bit (4 floats / 2 doubles), AVX2 = 256-bit (8 floats / 4 doubles / 8 ints), AVX-512 = 512-bit (16 floats).\n\nThe auto-vectoriser needs:\n\n1. A countable loop (trip count known when the loop starts), no early `break` in most cases.\n2. No possible **aliasing** between input and output: use `__restrict` or separate arrays.\n3. No loop-carried dependency it cannot handle. A floating-point sum is one: FP addition is not associative, so without `-ffast-math` (or `-fassociative-math`) the compiler will not reorder `((a+b)+c)+d` into a vector reduction. Integer sums vectorise fine.\n4. Contiguous data (arrays / `std::vector`, struct-of-arrays), not linked lists.\n\n```cpp\nvoid scale(float* __restrict out, const float* __restrict in, float k, int n) {\n    for (int i = 0; i < n; ++i) out[i] = in[i] * k;   // -O3 -march=native: vmulps on 8 floats at a time\n}\n```\n\nManual SIMD with intrinsics (`<immintrin.h>`, e.g. `_mm256_add_ps`) is possible but only after the compiler fails. Check with `-fopt-info-vec` (GCC) or `-Rpass=loop-vectorize` (Clang)."
+  },
+  {
+   "heading": "constexpr, consteval and compile-time lookup tables",
+   "body": "The fastest computation is one done at **compile time**. `constexpr` functions *may* run at compile time (and must when used in a constant expression); `consteval` functions *must*.\n\n```cpp\n#include <array>\n#include <cstdint>\n\nconstexpr std::array<std::int64_t, 19> make_pow10() {\n    std::array<std::int64_t, 19> t{};\n    std::int64_t v = 1;\n    for (std::size_t i = 0; i < t.size(); ++i) { t[i] = v; v *= 10; }\n    return t;\n}\nconstexpr auto POW10 = make_pow10();          // built by the compiler, stored in .rodata\nstatic_assert(POW10[6] == 1'000'000);          // checked at compile time\n\ninline std::int64_t scale_price(std::int64_t px, int decimals) {\n    return px * POW10[decimals];               // one load + one multiply, no std::pow\n}\n```\n\n- A lookup table replaces expensive work (`std::pow`, divisions, a `switch` on message type, CRC tables) with one L1-cached load (~1 ns) as long as the table is small (a few KB fits in a 32-48 KB L1d).\n- `constexpr` variables are initialised before `main` with no runtime cost and no static-init-order problems.\n- `if constexpr` removes untaken branches at compile time inside templates.\n- `const` alone does **not** mean compile-time: `const int x = read();` is just read-only."
+  },
+  {
+   "heading": "Micro-optimisations: temporaries, references and moves",
+   "body": "Everything below is about removing work the hardware does not need to do.\n\n| Do | Avoid | Why |\n|---|---|---|\n| Pass big objects as `const T&` (or `std::string_view`, `std::span`) | Passing `std::string`/`std::vector` by value to a read-only function | By value copies and may heap-allocate (~20-100 ns per malloc) |\n| Pass small trivially-copyable types (`int`, `double`, a 16-byte `Price`) **by value** | `const int&` | By value travels in registers; a reference forces a memory address and may block optimisations (aliasing) |\n| `v.reserve(n)` before a known number of `push_back`s | Growing from empty | Each reallocation copies/moves every element |\n| `emplace_back(args...)`, `std::move` into sinks | `push_back(T(args))` of a temporary you then copy | Avoid an extra construction / copy |\n| Hoist invariant work (`size()`, lookups) out of the loop | Recomputing in every iteration | Compiler cannot always prove it is invariant (aliasing) |\n| `++it` on iterators | `it++` on heavy iterators | Post-increment makes a copy |\n| Reuse buffers (`clear()` keeps capacity) | Creating a new `std::string` every message | Allocation on the hot path |\n| Multiply by a reciprocal / shift for powers of two | Division in a hot loop | 64-bit `div` is ~20-40 cycles vs ~3-4 for `mul` |\n\n```cpp\nstd::string make_key(const std::string& sym, int id);   // reads only: const&\nvoid set_name(std::string name) { name_ = std::move(name); }   // sink: by value + move\n```\n\n**Return by value** is fine: RVO (guaranteed copy elision in C++17 for prvalues) and NRVO mean no copy."
+  },
+  {
+   "heading": "Avoiding virtual calls in hot loops",
+   "body": "A virtual call costs a load of the vptr, a load from the v-table and an **indirect branch** (~1-3 ns if predicted, ~5-10 ns+ if mispredicted). The bigger cost is that the compiler **cannot inline** it, so no constant folding or vectorisation across the call.\n\n```cpp\nstruct Strategy { virtual double signal(double px) = 0; virtual ~Strategy() = default; };\n\nfor (auto& tick : ticks) total += strat->signal(tick.px);   // indirect call every tick\n```\n\nWays out:\n\n1. **`final`**: mark the class or function `final`; when the static type is the final class the compiler devirtualises.\n2. **CRTP** (static polymorphism): `template <class D> struct Base { double signal(double p) { return static_cast<D*>(this)->signal_impl(p); } };`: resolved at compile time, inlinable.\n3. **Templates / concepts**: pass the strategy as a template parameter.\n4. **`std::variant` + `std::visit`**: closed set of types, switch-like dispatch, no heap.\n5. **Hoist the dispatch** out of the loop: decide the type once, then run a loop specialised for it.\n\nSpeculative devirtualisation (GCC `-fdevirtualize-speculatively`, PGO) can add a \"if vptr == X then inline X\" fast path, but do not rely on it on the hot path."
+  },
+  {
+   "heading": "Branch prediction and branchless code",
+   "body": "Modern CPUs have a 15-20 stage pipeline and fetch ahead by **predicting** branches. A correct prediction is almost free; a **misprediction** flushes the pipeline: ~15-20 cycles (~5 ns at 3-4 GHz). Random 50/50 branches in a hot loop are expensive; predictable ones (almost always taken) are cheap.\n\nTools:\n\n```cpp\nif (msg.type == Type::Trade) [[likely]] { handle_trade(msg); }        // C++20 attributes\nif (__builtin_expect(err != 0, 0)) { handle_error(); }                  // GCC/Clang: expect false\n```\n\nThese hints change **code layout** (hot path falls through, cold code moved away) more than the predictor itself.\n\n**Branchless** code replaces a data-dependent branch with arithmetic or a conditional move (`cmov`):\n\n```cpp\nint m = (a < b) ? a : b;                 // -O2 on x86-64: cmp + cmov, no branch\nint clamp0(int x) { return x & -(x > 0); }   // mask trick: x if positive else 0\nsum += (v[i] >= 128) * v[i];             // count/accumulate without a branch\n```\n\n- Branchless wins when the condition is **unpredictable** (random data).\n- It loses when the branch is highly predictable and one side is expensive: branchless always pays for both sides.\n- The ternary operator does not *guarantee* a `cmov`; the compiler chooses. Check the assembly.\n- Classic demonstration: summing elements `>= 128` of a random array is several times faster after sorting the array (the branch becomes predictable), or with a branchless version (fast regardless)."
+  },
+  {
+   "heading": "Timing code with std::chrono",
+   "body": "```cpp\n#include <chrono>\nusing clk = std::chrono::steady_clock;\n\nauto t0 = clk::now();\nrun_order_book_updates();\nauto t1 = clk::now();\nauto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();\nstd::cout << \"took \" << ns << \" ns\\n\";\n```\n\n| Clock | Property | Use |\n|---|---|---|\n| `steady_clock` | **Monotonic**, never jumps backwards, not affected by NTP/user changes | Measuring intervals: use this |\n| `system_clock` | Wall-clock time (can jump) | Timestamps, logging |\n| `high_resolution_clock` | Shortest tick available; in libstdc++ it is an alias of `system_clock`, in MSVC of `steady_clock` | Avoid for intervals: not guaranteed monotonic |\n\n- On Linux `clock_gettime` via the vDSO costs ~20-30 ns per `now()`. To time a 50 ns function, time a **batch** of many calls and divide, or use `rdtsc` (`__rdtsc()`, ~6-10 ns, needs invariant TSC and conversion to ns).\n- Report a **distribution** (p50, p99, p99.9, max), not just the mean: HFT cares about tail latency."
+  },
+  {
+   "heading": "Benchmarking pitfalls",
+   "body": "1. **Dead-code elimination**: if the result is unused, `-O2` deletes the work and you time nothing. **In class:** the Lec-12 SPSC benchmark adds each popped value into a global `std::uint64_t g_sink;` with the comment \"global => compiler is NOT allowed to delete the pops\". Google Benchmark uses `benchmark::DoNotOptimize(x)` for the same purpose; the Lec-1 benchmark used `volatile`.\n2. **Constant folding**: if inputs are compile-time constants the compiler may compute the answer at compile time. Read inputs at runtime.\n3. **Warm-up**: first iterations pay for page faults, cold caches, cold branch predictors and CPU frequency ramp-up. Discard them.\n4. **Noise**: pin the thread to a core (`taskset -c 3 ./bench`), disable turbo/frequency scaling, run many repetitions, report median and percentiles.\n5. **Build flags**: always benchmark the release build (`-O2`/`-O3`, same flags as production). **In class** the SPSC benchmark was built with `g++ -O3 -march=native -std=c++17 -pthread`.\n6. **Timer overhead**: `now()` itself costs ~20 ns; do not time single tiny operations.\n7. **Unrealistic data**: random vs real market data changes branch prediction and cache behaviour completely."
+  },
+  {
+   "heading": "Profiling: gprof and perf",
+   "body": "**gprof** (instrumentation + sampling):\n\n```bash\ng++ -O2 -pg book.cpp -o book     # -pg inserts mcount() calls into every function\n./book                           # writes gmon.out on normal exit\ngprof ./book gmon.out | less     # flat profile (self time per function) + call graph\n```\n\nDownsides: instrumentation overhead distorts tiny functions, inlined functions disappear, multithreading support is poor.\n\n**perf** (Linux, hardware performance counters, sampling, no recompilation; build with `-g` for symbols):\n\n```bash\nperf stat -e cycles,instructions,branch-misses,cache-misses,L1-dcache-load-misses ./book\nperf record -g ./book            # sample call stacks (~4000 samples/s by default)\nperf report                      # hottest functions\nperf annotate                    # hottest instructions inside a function\nperf c2c record / report         # cache-line contention: false sharing (HITM)\n```\n\n- Read **IPC** (instructions per cycle) from `perf stat`: below ~1 often means memory-bound or mispredicting; 3-4 is excellent.\n- **In class:** the Lec-12 SPSC header describes using `perf c2c` to spot the head/tail cache line ping-ponging between the producer and consumer cores (HITM = hit in another core's Modified line).\n- Other tools: Valgrind `callgrind`/`cachegrind` (exact counts, ~50x slower), Intel VTune, `strace` for syscalls."
+  },
+  {
+   "heading": "The workflow: measure, find hot spots, optimise, re-measure",
+   "body": "1. **Measure** a realistic workload end-to-end (latency distribution or throughput).\n2. **Profile** (`perf record`) to find the hot spot. Usually 1-2 functions take most of the time.\n3. **Understand why** it is slow: `perf stat` counters (cache misses? branch misses? low IPC?), read the assembly.\n4. **Optimise one thing**, preferably algorithm and data layout first, micro-tricks last.\n5. **Re-measure** and keep the change only if it helps. Check correctness against the old version.\n\n**Amdahl's law:** if a part taking fraction `p` of runtime gets `s` times faster, overall speedup = `1 / ((1 - p) + p / s)`. Making a 10 % function 2x faster gives only ~1.05x overall. Optimise what the profile says is hot.\n\nExample, a Monte Carlo option pricer loop:\n\n```cpp\n// before: std::pow + exp per path, new RNG per path, results pushed into a growing vector\n// after:\nstd::mt19937_64 rng(42);                       // one RNG, reused\nstd::normal_distribution<double> N01;\nconst double drift = (r - 0.5 * sig * sig) * T;  // hoisted loop invariants\nconst double vol   = sig * std::sqrt(T);\ndouble sum = 0.0;\nfor (int i = 0; i < paths; ++i) {\n    double ST = S0 * std::exp(drift + vol * N01(rng));\n    sum += std::max(ST - K, 0.0);              // branchless payoff (maxsd)\n}\ndouble price = std::exp(-r * T) * sum / paths;\n```\n\nFor an **order-book update loop** the profile usually points at the level lookup (tree pointer chasing, cache misses) and allocation per order, which leads to flat arrays and memory pools (sessions 12 and 14)."
+  },
+  {
+   "heading": "Quick revision",
+   "body": "- As-if rule: the compiler may do anything that does not change observable behaviour.\n- In class: `volatile counter` forced one load + store per iteration so the 100M-iteration loop was not folded away.\n- C++ `volatile` is not for threads; use `std::atomic`.\n- `-O2` is the release default; `-O3` adds aggressive inlining, peeling/unrolling and vectorisation; `-Ofast` adds `-ffast-math`.\n- `-march=native` = use this CPU's instruction sets, binary may not be portable.\n- `inline` keyword = ODR permission; actual inlining is the optimiser's decision.\n- Inlining's real benefit is enabling further optimisation; cost is code bloat / I-cache.\n- Vectorisation needs contiguous data, no aliasing (`__restrict`), countable loops; FP reductions need `-ffast-math`.\n- AVX2 = 256 bits = 8 floats / 4 doubles.\n- `constexpr` tables are built at compile time and live in `.rodata`.\n- Pass small types by value, big ones by `const&`; sinks by value + `std::move`.\n- Virtual call = indirect branch + no inlining; fix with `final`, CRTP, templates, `std::variant`.\n- Branch mispredict ~15-20 cycles; branchless (`cmov`, masks) wins on unpredictable data.\n- Time intervals with `steady_clock`, never `system_clock`.\n- Benchmarks: use the result (global sink / DoNotOptimize), warm up, pin cores, report percentiles.\n- gprof needs `-pg` and writes `gmon.out`; perf uses hardware counters and needs no recompilation.\n- `perf stat` (counts), `perf record`/`report`/`annotate` (where), `perf c2c` (false sharing).\n- Amdahl: speedup = 1 / ((1-p) + p/s)."
+  },
+  {
+   "heading": "Exam traps",
+   "body": "- \"`-O3` is always faster than `-O2`\": false. Bigger code can cause I-cache misses; measure.\n- \"`inline` forces inlining\": false; it is an ODR rule plus a weak hint.\n- \"`volatile` makes a counter thread-safe\": false; `counter = counter + 1` on a volatile is still a separate load and store, so two threads lose increments. Use `std::atomic<long>` and `fetch_add`.\n- \"`high_resolution_clock` is the right clock for benchmarks\": not guaranteed monotonic (alias of `system_clock` in libstdc++). Use `steady_clock`.\n- A benchmark that prints ~0 ns usually means the work was optimised away, not that the code is fast.\n- `const int& x` parameter for an `int` is not faster; it can be slower.\n- `-ffast-math` can change results and break `std::isnan` checks (it assumes no NaN).\n- A float sum loop not vectorising at `-O3` is expected (non-associative FP), not a compiler bug.\n- Branchless code is not automatically faster: if the branch is 99 % predictable, the branchy version is usually as fast or faster.\n- gprof profiles of heavily inlined code are misleading: the inlined function's time is charged to its caller.\n- Benchmarking at `-O0` measures the debugger-friendly build and is meaningless for performance claims."
+  }
+ ],
+ "keyTerms": [
+  {
+   "term": "As-if rule",
+   "def": "The compiler may transform the program in any way that does not change its observable behaviour."
+  },
+  {
+   "term": "volatile (C++)",
+   "def": "Every access is observable and must be performed; gives no atomicity or thread ordering."
+  },
+  {
+   "term": "-O2",
+   "def": "Standard release optimisation level: inlining, CSE, LICM, scheduling, without size-for-speed trades."
+  },
+  {
+   "term": "-O3",
+   "def": "-O2 plus aggressive inlining, loop peeling/unswitching and full auto-vectorisation."
+  },
+  {
+   "term": "-Ofast",
+   "def": "-O3 plus -ffast-math; not strictly IEEE-754 compliant."
+  },
+  {
+   "term": "-march=native",
+   "def": "Generate code for every instruction-set extension of the build machine's CPU."
+  },
+  {
+   "term": "Inlining",
+   "def": "Replacing a call with the callee's body, enabling further optimisations across the call."
+  },
+  {
+   "term": "Loop unrolling",
+   "def": "Executing several iterations per loop trip to cut branch overhead and expose parallelism."
+  },
+  {
+   "term": "SIMD / vectorisation",
+   "def": "One instruction operating on several data elements (SSE 128-bit, AVX2 256-bit, AVX-512)."
+  },
+  {
+   "term": "__restrict",
+   "def": "Promise that a pointer is the only way to access its object, allowing vectorisation without alias checks."
+  },
+  {
+   "term": "constexpr lookup table",
+   "def": "A table computed by the compiler and stored in read-only data, replacing runtime computation with a load."
+  },
+  {
+   "term": "Devirtualisation",
+   "def": "Compiler turning a virtual call into a direct (inlinable) call when the dynamic type is known."
+  },
+  {
+   "term": "cmov",
+   "def": "x86 conditional move: selects a value without a branch, so no misprediction."
+  },
+  {
+   "term": "steady_clock",
+   "def": "Monotonic std::chrono clock; the right clock for measuring elapsed time."
+  },
+  {
+   "term": "Dead-code elimination",
+   "def": "Removing computations whose results are never used; the classic way benchmarks lie."
+  },
+  {
+   "term": "gprof",
+   "def": "Profiler using -pg instrumentation plus sampling; output in gmon.out with a flat profile and call graph."
+  },
+  {
+   "term": "perf",
+   "def": "Linux profiler using hardware performance counters: stat, record, report, annotate, c2c."
+  },
+  {
+   "term": "IPC",
+   "def": "Instructions per cycle; low IPC suggests memory stalls or branch mispredictions."
+  },
+  {
+   "term": "PGO",
+   "def": "Profile-guided optimisation: build, run a training workload, rebuild using the measured branch/loop profile."
+  },
+  {
+   "term": "Amdahl's law",
+   "def": "Overall speedup = 1 / ((1 - p) + p / s) when a fraction p is sped up by s."
+  }
+ ],
+ "mcqs": [
+  {
+   "q": "In class we benchmarked `volatile long counter; void sendOrder(){ counter = counter + 1; }` called 100,000,000 times. Why was `counter` declared `volatile`?",
+   "options": [
+    "To make the increment atomic across threads",
+    "To force the compiler to perform a real load and store every iteration instead of folding the loop away",
+    "To put the counter in a CPU register for speed",
+    "Because globals must be volatile in C++"
+   ],
+   "answer": 1,
+   "explanation": "volatile accesses are observable behaviour, so the optimiser must keep one load and one store per iteration; the benchmark then measures real work.",
+   "distractors": "volatile gives no atomicity, it prevents register caching rather than causing it, and globals need no volatile.",
+   "source": "lecture",
+   "id": "L11-m1"
+  },
+  {
+   "q": "Remove `volatile` from the class benchmark and compile with `g++ -O2`. What does the loop most likely become?",
+   "options": [
+    "A single `counter += 100000000` (or equivalent) with no loop",
+    "100 million inlined load/add/store sequences",
+    "100 million calls to sendOrder()",
+    "A compile error because the loop has no side effects"
+   ],
+   "answer": 0,
+   "explanation": "After inlining, the compiler sees a loop that only adds 1 to a non-volatile global and folds it into one addition.",
+   "distractors": "Calls and per-iteration memory operations are exactly what -O2 removes; side-effect-free loops are legal.",
+   "source": "lecture",
+   "id": "L11-m2"
+  },
+  {
+   "q": "Which GCC flag set enables `-ffast-math` in addition to `-O3`?",
+   "options": [
+    "-flto",
+    "-O3 -march=native",
+    "-Os",
+    "-Ofast"
+   ],
+   "answer": 3,
+   "explanation": "-Ofast = -O3 plus -ffast-math (non-IEEE floating-point shortcuts).",
+   "distractors": "-march=native picks instruction sets, -Os optimises size, -flto enables link-time optimisation; none relax FP rules.",
+   "source": "lecture",
+   "id": "L11-m3"
+  },
+  {
+   "q": "What is the main meaning of the `inline` keyword on a function in modern C++?",
+   "options": [
+    "The compiler must inline every call",
+    "The function cannot be recursive",
+    "The definition may appear in multiple translation units without violating the ODR",
+    "The function is evaluated at compile time"
+   ],
+   "answer": 2,
+   "explanation": "inline is primarily an ODR exemption needed for functions defined in headers; inlining decisions belong to the optimiser.",
+   "distractors": "It forces nothing, recursion is allowed, and compile-time evaluation is constexpr/consteval.",
+   "source": "lecture",
+   "id": "L11-m4"
+  },
+  {
+   "q": "A loop `for (i...) s += a[i];` over `float a[]` vectorises as an integer loop but not as a float loop at plain `-O3`. Why?",
+   "options": [
+    "Floats cannot be loaded into SIMD registers",
+    "Floating-point addition is not associative, so reordering the sum would change results without -ffast-math",
+    "The loop is not countable",
+    "Floats are always aliased"
+   ],
+   "answer": 1,
+   "explanation": "A vector reduction adds elements in a different order; for FP that changes rounding, so the compiler needs permission (-ffast-math / -fassociative-math).",
+   "distractors": "SIMD handles floats natively, the loop is countable, and aliasing is not the issue for a pure reduction.",
+   "source": "lecture",
+   "id": "L11-m5"
+  },
+  {
+   "q": "What does `__restrict` on two pointer parameters tell the compiler?",
+   "options": [
+    "The pointers never refer to overlapping memory, so loads and stores can be reordered and vectorised",
+    "The pointed-to data is read-only",
+    "The pointers are aligned to 64 bytes",
+    "The pointers are never null"
+   ],
+   "answer": 0,
+   "explanation": "restrict is a no-aliasing promise; without it the compiler must assume writes through one pointer could change data read through the other.",
+   "distractors": "It says nothing about alignment, const-ness or null.",
+   "source": "lecture",
+   "id": "L11-m6"
+  },
+  {
+   "q": "Which std::chrono clock should you use to measure how long a function takes?",
+   "options": [
+    "std::chrono::file_clock",
+    "std::chrono::system_clock",
+    "std::chrono::high_resolution_clock, because it is always monotonic",
+    "std::chrono::steady_clock"
+   ],
+   "answer": 3,
+   "explanation": "steady_clock is guaranteed monotonic and never jumps, which is what interval measurement needs.",
+   "distractors": "system_clock can jump with NTP; high_resolution_clock is often just system_clock (libstdc++) and is not guaranteed monotonic; file_clock is for file times.",
+   "source": "lecture",
+   "id": "L11-m7"
+  },
+  {
+   "q": "A benchmark times `for (int i = 0; i < 1e8; ++i) x += i * 3;` where `x` is a local never used afterwards, built with -O2. It reports ~0 ns. Most likely cause?",
+   "options": [
+    "The CPU executed 1e8 iterations in under a nanosecond",
+    "steady_clock has too little resolution",
+    "Dead-code elimination removed the loop because its result is unused",
+    "Branch prediction made the loop free"
+   ],
+   "answer": 2,
+   "explanation": "With x unused, the as-if rule allows the whole loop to be deleted; use the result (global sink, DoNotOptimize, print it).",
+   "distractors": "No CPU does 1e8 iterations in 1 ns, clock resolution is ~ns, and prediction cannot erase work.",
+   "source": "lecture",
+   "id": "L11-m8"
+  },
+  {
+   "q": "In the class SPSC benchmark (`main.cpp`), popped values are added to a global `std::uint64_t g_sink`. What is its purpose?",
+   "options": [
+    "To share data between producer and consumer",
+    "To prevent the compiler from optimising away the pops, since a global's value is observable",
+    "To make the queue lock-free",
+    "To align the queue to a cache line"
+   ],
+   "answer": 1,
+   "explanation": "The comment in class: global => compiler is NOT allowed to delete the pops. It is a benchmark sink.",
+   "distractors": "Data sharing is the queue's job, lock-freedom comes from atomics, and alignment comes from alignas.",
+   "source": "lecture",
+   "id": "L11-m9"
+  },
+  {
+   "q": "What must you do to profile with gprof?",
+   "options": [
+    "Compile and link with -pg, run the program to produce gmon.out, then run gprof",
+    "Run `perf record` first",
+    "Nothing, gprof reads hardware counters directly",
+    "Compile with -O0 only"
+   ],
+   "answer": 0,
+   "explanation": "gprof relies on instrumentation inserted by -pg and the gmon.out file written at exit.",
+   "distractors": "perf is a separate tool; reading hardware counters is perf's model; -O0 is not required.",
+   "source": "lecture",
+   "id": "L11-m10"
+  },
+  {
+   "q": "Which perf command shows how many cycles, instructions and branch misses a program incurred overall?",
+   "options": [
+    "perf annotate",
+    "perf report",
+    "perf c2c",
+    "perf stat"
+   ],
+   "answer": 3,
+   "explanation": "perf stat counts hardware events for the whole run and prints IPC.",
+   "distractors": "annotate/report show where samples land after perf record; c2c analyses cache-line contention.",
+   "source": "lecture",
+   "id": "L11-m11"
+  },
+  {
+   "q": "Roughly how much does one branch misprediction cost on a modern x86 core?",
+   "options": [
+    "About 1 cycle",
+    "About 300 cycles",
+    "About 15-20 cycles",
+    "About 10,000 cycles"
+   ],
+   "answer": 2,
+   "explanation": "The pipeline must be flushed and refilled, roughly its depth: 15-20 cycles (~5 ns).",
+   "distractors": "1 cycle is a predicted branch; ~300 cycles is a DRAM miss; 10,000 cycles is syscall/context-switch territory.",
+   "source": "lecture",
+   "id": "L11-m12"
+  },
+  {
+   "q": "On x86-64 with -O2, `int m = (a < b) ? a : b;` (ints) is typically compiled to:",
+   "options": [
+    "A conditional jump and two moves",
+    "cmp followed by cmov (no branch)",
+    "A call to std::min",
+    "A lookup table"
+   ],
+   "answer": 1,
+   "explanation": "Simple selects between two registers usually become cmov, which cannot mispredict.",
+   "distractors": "Compilers avoid the jump for a trivial select, do not emit a library call, and no table is involved.",
+   "source": "lecture",
+   "id": "L11-m13"
+  },
+  {
+   "q": "A function that is 10 % of total runtime is made 2x faster. What is the overall speedup (Amdahl's law)?",
+   "options": [
+    "About 1.05x",
+    "About 1.10x",
+    "About 1.20x",
+    "2x"
+   ],
+   "answer": 0,
+   "explanation": "1 / (0.9 + 0.1/2) = 1 / 0.95 = 1.053.",
+   "distractors": "1.10x and 1.20x overestimate; 2x would require the whole program to be sped up.",
+   "source": "lecture",
+   "id": "L11-m14"
+  },
+  {
+   "q": "Why can calling a virtual function inside a tight loop be much slower than a direct call?",
+   "options": [
+    "Virtual functions always allocate on the heap",
+    "The v-table is rebuilt on every call",
+    "Virtual functions cannot take arguments by reference",
+    "It is an indirect call the compiler usually cannot inline, which also blocks vectorisation and constant folding"
+   ],
+   "answer": 3,
+   "explanation": "The indirect branch costs a little; losing inlining (and everything inlining enables) costs a lot.",
+   "distractors": "No heap allocation or v-table rebuild happens, and argument passing is unaffected.",
+   "source": "lecture",
+   "id": "L11-m15"
+  },
+  {
+   "q": "What does `constexpr auto T = make_table();` (a constexpr function returning std::array) cost at runtime?",
+   "options": [
+    "The table is built before every use",
+    "It is built lazily on first access with a guard variable",
+    "Nothing to build: the compiler computes it and stores it in read-only data; uses are plain loads",
+    "It is built by a static constructor before main"
+   ],
+   "answer": 2,
+   "explanation": "A constexpr variable must be initialised by a constant expression, so the values are baked into the binary.",
+   "distractors": "Lazy guarded init is for function-local statics with runtime initialisers; static constructors are for dynamic initialisation.",
+   "source": "lecture",
+   "id": "L11-m16"
+  },
+  {
+   "q": "Which parameter type is best for a function that only reads a `std::string` on a hot path?",
+   "options": [
+    "std::string (by value)",
+    "const std::string& or std::string_view",
+    "std::string&& always",
+    "std::string* copied into a new string"
+   ],
+   "answer": 1,
+   "explanation": "No copy and no allocation; string_view also accepts literals without constructing a string.",
+   "distractors": "By value copies (may allocate), && forces callers to give up their string, copying into a new string allocates.",
+   "source": "lecture",
+   "id": "L11-m17"
+  },
+  {
+   "q": "What is a risk of shipping a binary built with `-march=native`?",
+   "options": [
+    "It may crash with an illegal-instruction error on a CPU lacking the instruction sets of the build machine",
+    "It disables all optimisation",
+    "It prevents inlining across files",
+    "It makes floating-point non-IEEE"
+   ],
+   "answer": 0,
+   "explanation": "The compiler uses AVX2/AVX-512 etc. if the build CPU has them; older targets cannot execute them.",
+   "distractors": "It enables, not disables, optimisation; LTO and fast-math are unrelated flags.",
+   "source": "lecture",
+   "id": "L11-m18"
+  },
+  {
+   "q": "Does this compile, and what is `X` used for?\n    constexpr int sq(int x) { return x * x; }\n    int n = read_int();\n    constexpr int X = sq(n);",
+   "options": [
+    "Compiles; X is computed at runtime",
+    "Compiles; X is computed at compile time",
+    "Compiles but is undefined behaviour",
+    "Does not compile: a constexpr variable needs a constant expression, and n is a runtime value"
+   ],
+   "answer": 3,
+   "explanation": "sq is constexpr, but its argument n is not a constant expression, so `constexpr int X` cannot be initialised. `int X = sq(n);` (runtime call) would compile.",
+   "distractors": "constexpr variables are never silently computed at runtime; this is a hard error, not UB.",
+   "source": "lecture",
+   "id": "L11-m19"
+  },
+  {
+   "q": "Which change most directly lets the compiler devirtualise and inline `obj.price()` when `obj` is statically known to be of type `Fast` (derived from an abstract `Instrument`)?",
+   "options": [
+    "Add `volatile` to `obj`",
+    "Make `price()` a static data member",
+    "Mark `Fast` (or `Fast::price`) as `final`",
+    "Compile with -O0"
+   ],
+   "answer": 2,
+   "explanation": "final guarantees no further override exists, so a call through a Fast reference or pointer can be bound statically and inlined.",
+   "distractors": "Static data members are unrelated, volatile blocks optimisation, and -O0 does no devirtualisation.",
+   "source": "lecture",
+   "id": "L11-m20"
+  },
+  {
+   "q": "What does `perf c2c` help you find?",
+   "options": [
+    "Memory leaks",
+    "Cache lines bouncing between cores, such as false sharing (HITM events)",
+    "Unused functions",
+    "Syscall counts"
+   ],
+   "answer": 1,
+   "explanation": "c2c = cache-to-cache; it reports loads that hit a line Modified in another core's cache, the signature of true and false sharing.",
+   "distractors": "Leaks are found with ASan/valgrind, unused functions with the linker, syscalls with strace.",
+   "source": "lecture",
+   "id": "L11-m21"
+  },
+  {
+   "q": "Replacing `x / 8` with `x >> 3` for a **signed** int `x` in source code:",
+   "options": [
+    "Changes results for negative x (division truncates toward zero, an arithmetic shift rounds toward negative infinity), and the compiler already emits a shift plus fix-up for /8",
+    "Is always identical, since compilers never optimise division",
+    "Is undefined behaviour for all x",
+    "Makes the code slower"
+   ],
+   "answer": 0,
+   "explanation": "-9/8 == -1 but -9>>3 == -2. Compilers already strength-reduce division by a power of two, adding a small correction for negatives; for unsigned it is a plain shift.",
+   "distractors": "Compilers do optimise division by constants; right shift of negatives is implementation-defined pre-C++20 and arithmetic since C++20, not UB, and a shift is not slower.",
+   "source": "lecture",
+   "id": "L11-m22"
+  },
+  {
+   "q": "A gprof flat profile shows `matchOrders()` taking 0 % while the program is clearly busy in matching code. Most likely reason?",
+   "options": [
+    "gprof cannot profile C++",
+    "matchOrders() runs on the GPU",
+    "The program was compiled with -pg",
+    "matchOrders() was inlined into its caller, so its time is attributed to the caller"
+   ],
+   "answer": 3,
+   "explanation": "Inlined functions no longer exist as separate functions, so profilers charge their samples to the caller. Use -fno-inline for diagnosis or perf annotate on the caller.",
+   "distractors": "gprof supports C++, -pg is required for gprof to work, and nothing here runs on a GPU.",
+   "source": "lecture",
+   "id": "L11-m23"
+  },
+  {
+   "q": "You call `steady_clock::now()` around a function that takes ~30 ns. What is the main problem with the measurement?",
+   "options": [
+    "steady_clock only has second resolution",
+    "steady_clock is not monotonic",
+    "The call to now() itself costs around 20 ns, comparable to what you measure, so you should time many calls in a batch",
+    "now() flushes the cache"
+   ],
+   "answer": 2,
+   "explanation": "On Linux, clock_gettime through the vDSO is ~20-30 ns, so overhead and noise dominate a single 30 ns measurement.",
+   "distractors": "Resolution is nanoseconds on Linux, steady_clock is monotonic by definition, and now() does not flush caches.",
+   "source": "lecture",
+   "id": "L11-m24"
+  },
+  {
+   "q": "A Monte Carlo pricer constructs a new `std::mt19937_64` and computes `(r - 0.5*sig*sig)*T` inside the per-path loop. perf shows the loop is hot. What is the best first optimisation?",
+   "options": [
+    "Rewrite the loop in assembly",
+    "Use one RNG created outside the loop and hoist the loop-invariant drift and volatility terms out of the loop",
+    "Switch to -O0 so the profile is easier to read",
+    "Make the accumulator volatile"
+   ],
+   "answer": 1,
+   "explanation": "Seeding an mt19937_64 initialises ~2.5 KB of state per path and the drift term never changes; hoisting removes repeated work the compiler may not remove itself (the RNG construction has side effects).",
+   "distractors": "Assembly is premature, -O0 profiles are meaningless for performance, and volatile adds memory traffic.",
+   "source": "lecture",
+   "id": "L11-m25"
+  }
+ ],
+ "msqs": [
+  {
+   "q": "Which of the following are true about the class benchmark `volatile long counter; counter = counter + 1;` in a 100M-iteration loop? (select all that apply)",
+   "options": [
+    "volatile forces a load and a store of counter every iteration",
+    "volatile makes the increment atomic",
+    "Without volatile, -O2 can replace the loop with one addition",
+    "Two threads running this loop on the same counter can lose increments",
+    "volatile prevents the CPU from caching counter in L1"
+   ],
+   "answers": [
+    0,
+    2,
+    3
+   ],
+   "explanation": "volatile only constrains the compiler: each access must be emitted, so without it the loop folds into one add. It gives no atomicity, so concurrent load/add/store sequences lose updates. It does not bypass the CPU cache; the line still lives in L1.",
+   "id": "L11-x1"
+  },
+  {
+   "q": "Which optimisations are typically enabled at -O3 but not (or much less aggressively) at -O2 in GCC? (select all that apply)",
+   "options": [
+    "Full auto-vectorisation of loops",
+    "Loop unswitching",
+    "Dead-code elimination",
+    "More aggressive inlining",
+    "Register allocation"
+   ],
+   "answers": [
+    0,
+    1,
+    3
+   ],
+   "explanation": "-O3 adds full vectorisation, unswitching and more aggressive inlining/cloning. Dead-code elimination and register allocation are already done at -O1/-O2.",
+   "id": "L11-x2"
+  },
+  {
+   "q": "Which of these can stop the compiler from auto-vectorising a loop? (select all that apply)",
+   "options": [
+    "Possible aliasing between the output and input pointers",
+    "Traversing a std::list",
+    "A floating-point sum without -ffast-math",
+    "Using a contiguous std::vector<int>",
+    "A call to a non-inlined function in the loop body"
+   ],
+   "answers": [
+    0,
+    1,
+    2,
+    4
+   ],
+   "explanation": "Aliasing, non-contiguous data, non-associative FP reductions and opaque calls all block vectorisation. A contiguous vector of ints is the ideal case, not an obstacle.",
+   "id": "L11-x3"
+  },
+  {
+   "q": "Which statements about `inline` and inlining are correct? (select all that apply)",
+   "options": [
+    "Member functions defined inside the class body are implicitly inline",
+    "The inline keyword guarantees the call is replaced by the body",
+    "Inlining can enable constant folding and vectorisation across the old call boundary",
+    "Over-inlining can hurt by increasing instruction-cache misses",
+    "A call through a function pointer to an unknown function can always be inlined"
+   ],
+   "answers": [
+    0,
+    2,
+    3
+   ],
+   "explanation": "In-class definitions are implicitly inline; inlining's main benefit is enabling further optimisation and its cost is code bloat. The keyword guarantees nothing, and an unknown target cannot be inlined.",
+   "id": "L11-x4"
+  },
+  {
+   "q": "Which are valid ways to avoid virtual-call overhead in a hot loop? (select all that apply)",
+   "options": [
+    "CRTP (static polymorphism)",
+    "Marking the derived class final",
+    "std::variant with std::visit over a closed set of types",
+    "Adding more virtual functions to the base class",
+    "Making the template parameter the concrete strategy type"
+   ],
+   "answers": [
+    0,
+    1,
+    2,
+    4
+   ],
+   "explanation": "CRTP, final, variant/visit and template parameters all resolve the call statically or via a switch. Adding virtual functions does nothing to remove dispatch.",
+   "id": "L11-x5"
+  },
+  {
+   "q": "Which of the following correctly describe std::chrono clocks? (select all that apply)",
+   "options": [
+    "steady_clock is monotonic",
+    "system_clock can jump backwards when the wall clock is adjusted",
+    "high_resolution_clock is guaranteed to be monotonic",
+    "In libstdc++, high_resolution_clock is an alias of system_clock",
+    "steady_clock::now() is free (0 ns)"
+   ],
+   "answers": [
+    0,
+    1,
+    3
+   ],
+   "explanation": "steady_clock never goes back, system_clock follows wall time and NTP adjustments, and libstdc++ aliases high_resolution_clock to system_clock. The standard does not guarantee high_resolution_clock is monotonic, and now() costs ~20 ns.",
+   "id": "L11-x6"
+  },
+  {
+   "q": "Which of these are common benchmarking mistakes? (select all that apply)",
+   "options": [
+    "Not using the computed result, so the work is optimised away",
+    "Discarding warm-up iterations",
+    "Benchmarking a -O0 build",
+    "Reporting only the mean latency for a latency-critical system",
+    "Pinning the benchmark thread to a core"
+   ],
+   "answers": [
+    0,
+    2,
+    3
+   ],
+   "explanation": "Unused results, debug builds and mean-only reporting all give misleading numbers. Discarding warm-up and pinning to a core are good practice.",
+   "id": "L11-x7"
+  },
+  {
+   "q": "Which statements about gprof and perf are true? (select all that apply)",
+   "options": [
+    "gprof requires compiling with -pg",
+    "perf uses hardware performance counters and sampling",
+    "perf requires recompiling with -pg",
+    "gprof writes its data to gmon.out",
+    "perf annotate shows hot instructions in the disassembly"
+   ],
+   "answers": [
+    0,
+    1,
+    3,
+    4
+   ],
+   "explanation": "gprof instruments with -pg and writes gmon.out; perf samples hardware counters without special compilation (only -g for symbols) and annotate maps samples to instructions.",
+   "id": "L11-x8"
+  },
+  {
+   "q": "Which are good micro-optimisations on a hot path? (select all that apply)",
+   "options": [
+    "Passing a large std::vector to a read-only function by const reference",
+    "Passing an int by const reference instead of by value",
+    "Calling reserve() before a known number of push_backs",
+    "Hoisting a loop-invariant computation out of the loop",
+    "Allocating a new std::string for every incoming message"
+   ],
+   "answers": [
+    0,
+    2,
+    3
+   ],
+   "explanation": "const& avoids copies of big objects, reserve avoids reallocations, and hoisting removes repeated work. Small types are cheaper by value, and per-message allocation is exactly what to avoid.",
+   "id": "L11-x9"
+  },
+  {
+   "q": "Which statements about branch prediction and branchless code are true? (select all that apply)",
+   "options": [
+    "A correctly predicted branch is nearly free",
+    "A misprediction costs roughly the pipeline depth (~15-20 cycles)",
+    "Branchless code is always faster than branchy code",
+    "[[likely]] and __builtin_expect mainly influence code layout",
+    "Sorting the input can make a data-dependent branch predictable"
+   ],
+   "answers": [
+    0,
+    1,
+    3,
+    4
+   ],
+   "explanation": "Prediction makes branches cheap until they mispredict; hints mostly reorder code so the hot path falls through; sorted data makes a threshold branch predictable. Branchless code pays for both sides and is not always faster.",
+   "id": "L11-x10"
+  },
+  {
+   "q": "Which statements about constexpr are correct? (select all that apply)",
+   "options": [
+    "A constexpr variable must be initialised with a constant expression",
+    "A constexpr function can also be called with runtime arguments",
+    "consteval functions may run at runtime",
+    "`const int x = read();` is a compile-time constant",
+    "A constexpr lookup table can live in read-only data with no runtime initialisation"
+   ],
+   "answers": [
+    0,
+    1,
+    4
+   ],
+   "explanation": "constexpr variables need constant initialisers, constexpr functions are usable at runtime too, and constexpr tables are baked into .rodata. consteval functions must run at compile time, and const only means read-only.",
+   "id": "L11-x11"
+  },
+  {
+   "q": "Which flags or techniques change what code the compiler generates for your CPU or workload? (select all that apply)",
+   "options": [
+    "-march=native",
+    "Profile-guided optimisation (-fprofile-generate / -fprofile-use)",
+    "-flto",
+    "Renaming local variables",
+    "-ffast-math"
+   ],
+   "answers": [
+    0,
+    1,
+    2,
+    4
+   ],
+   "explanation": "-march picks instruction sets, PGO uses measured branch profiles, LTO enables cross-file inlining and -ffast-math relaxes FP semantics. Variable names have no effect on generated code.",
+   "id": "L11-x12"
+  },
+  {
+   "q": "Which perf stat observations suggest the hot loop is memory-bound or stalling? (select all that apply)",
+   "options": [
+    "IPC around 0.5",
+    "A high cache-misses count relative to instructions",
+    "IPC around 3.5",
+    "Many L1-dcache-load-misses",
+    "Zero branch misses"
+   ],
+   "answers": [
+    0,
+    1,
+    3
+   ],
+   "explanation": "Low IPC together with many cache misses means the core waits on memory. IPC of 3.5 is excellent throughput, and zero branch misses says nothing about memory stalls.",
+   "id": "L11-x13"
+  }
+ ],
+ "short": [
+  {
+   "q": "Explain the C++ vs Java benchmark from class (a `volatile long counter` incremented 100 million times through `sendOrder()`). Why is `counter` volatile, what would -O2 do without it, why is the C++ version expected to be faster, and is the volatile counter safe to increment from two threads?",
+   "checks": [
+    {
+     "label": "Volatile forces real memory accesses / prevents optimisation",
+     "patterns": [
+      "volatile",
+      "optimi[sz]"
+     ]
+    },
+    {
+     "label": "Each iteration does a load and store",
+     "patterns": [
+      "load",
+      "store",
+      "memory access"
+     ]
+    },
+    {
+     "label": "Without volatile the loop is folded/removed",
+     "patterns": [
+      "fold",
+      "single add",
+      "remov",
+      "eliminat",
+      "collapse"
+     ]
+    },
+    {
+     "label": "C++ is native: no VM/JIT warm-up/GC",
+     "patterns": [
+      "\\bVM\\b",
+      "virtual machine",
+      "JIT",
+      "garbage",
+      "\\bGC\\b",
+      "native"
+     ]
+    },
+    {
+     "label": "Volatile is not thread-safe; use std::atomic",
+     "patterns": [
+      "atomic"
+     ]
+    }
+   ],
+   "modelAnswer": "`volatile` makes every read and write of `counter` observable behaviour, so the optimiser must do one real load and one store per iteration. That keeps the benchmark honest: we measure 100M real increments.\n\nWithout `volatile`, -O2 inlines `sendOrder()` and sees a loop that only adds 1 to a global, so it folds the loop into a single add (`counter += 100000000`) and the loop is removed; the timing would be ~0.\n\nC++ is expected to be faster because it compiles ahead of time to native machine code: no VM start-up, no JIT warm-up, no garbage collector pauses, and the compiler can optimise with full knowledge of the target. (After warm-up, Java's JIT can come close on such a simple loop.)\n\nIt is not thread-safe: C++ `volatile` gives no atomicity or ordering. `counter = counter + 1` is a separate load and store, so two threads lose increments. Use `std::atomic<long> counter; counter.fetch_add(1, std::memory_order_relaxed);`.",
+   "explanation": "The examiner wants the as-if rule applied to the class benchmark and the classic volatile-is-not-atomic trap.",
+   "id": "L11-s1"
+  },
+  {
+   "q": "Write a snippet that times a function `update_book()` with std::chrono and prints the elapsed nanoseconds. Say which clock you used and why.",
+   "checks": [
+    {
+     "label": "Uses steady_clock",
+     "patterns": [
+      "steady_clock"
+     ]
+    },
+    {
+     "label": "Calls now() twice",
+     "patterns": [
+      "now\\(\\)"
+     ]
+    },
+    {
+     "label": "Converts the duration (duration_cast / count)",
+     "patterns": [
+      "duration_cast",
+      "\\.count\\(\\)"
+     ]
+    },
+    {
+     "label": "Justifies: monotonic / not adjusted",
+     "patterns": [
+      "monoton",
+      "never (goes|jumps) back",
+      "not affected",
+      "NTP"
+     ]
+    }
+   ],
+   "modelAnswer": "```cpp\n#include <chrono>\n#include <iostream>\n\nvoid update_book();\n\nint main() {\n    using clk = std::chrono::steady_clock;\n    auto t0 = clk::now();\n    update_book();\n    auto t1 = clk::now();\n    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();\n    std::cout << ns << \" ns\\n\";\n}\n```\n\nI use `steady_clock` because it is monotonic: it never jumps backwards and is not affected by NTP or someone changing the wall clock. `system_clock` can jump, and `high_resolution_clock` is just an alias of `system_clock` in libstdc++. For very short functions, time a batch of many calls and divide, because `now()` itself costs ~20 ns.",
+   "explanation": "Correct clock choice with a reason, plus correct duration_cast usage.",
+   "id": "L11-s2"
+  },
+  {
+   "q": "Write a branchless function that returns the larger of two ints and explain when branchless code is faster and when it is not.",
+   "checks": [
+    {
+     "label": "Gives branchless code (ternary/cmov/mask)",
+     "patterns": [
+      "cmov",
+      "\\?",
+      "mask",
+      "\\^"
+     ]
+    },
+    {
+     "label": "Explains misprediction cost",
+     "patterns": [
+      "mispredict"
+     ]
+    },
+    {
+     "label": "Wins on unpredictable / random data",
+     "patterns": [
+      "unpredictable",
+      "random"
+     ]
+    },
+    {
+     "label": "Can lose when the branch is predictable or work is expensive",
+     "patterns": [
+      "predictable",
+      "both sides",
+      "always (pays|computes|executes)"
+     ]
+    }
+   ],
+   "modelAnswer": "```cpp\nint max_branchless(int a, int b) {\n    return a ^ ((a ^ b) & -(a < b));   // -(a<b) is all ones if a<b, else 0\n}\n// or simply: return (a > b) ? a : b;  // -O2 on x86-64 usually emits cmp + cmov\n```\n\nA branch costs nothing when predicted correctly, but a misprediction flushes the pipeline (~15-20 cycles). Branchless code (cmov or mask arithmetic) has no branch to mispredict, so it wins when the condition is unpredictable, e.g. random market data where each side is taken ~50 % of the time.\n\nIt is not faster when the branch is highly predictable (e.g. an error check that is almost never true) or when one side is expensive: branchless code always computes both sides and adds a data dependency, so the branchy version can be equal or faster. Measure.",
+   "explanation": "A correct branchless idiom and the predictability trade-off.",
+   "id": "L11-s3"
+  },
+  {
+   "q": "Show how to build a compile-time lookup table with constexpr (for example powers of 10 used to scale prices) and explain why it helps latency.",
+   "checks": [
+    {
+     "label": "Uses constexpr",
+     "patterns": [
+      "constexpr"
+     ]
+    },
+    {
+     "label": "Uses an array/table",
+     "patterns": [
+      "std::array",
+      "\\[\\d*\\]"
+     ]
+    },
+    {
+     "label": "Computed at compile time / rodata",
+     "patterns": [
+      "compile[- ]time",
+      "rodata",
+      "baked"
+     ]
+    },
+    {
+     "label": "Replaces runtime work with a load",
+     "patterns": [
+      "load",
+      "no (runtime )?(computation|std::pow|pow)",
+      "instead of"
+     ]
+    }
+   ],
+   "modelAnswer": "```cpp\n#include <array>\n#include <cstdint>\n\nconstexpr std::array<std::int64_t, 19> make_pow10() {\n    std::array<std::int64_t, 19> t{};\n    std::int64_t v = 1;\n    for (auto& x : t) { x = v; v *= 10; }\n    return t;\n}\nconstexpr auto POW10 = make_pow10();\nstatic_assert(POW10[3] == 1000);\n\ninline std::int64_t to_ticks(std::int64_t px, int dec) { return px * POW10[dec]; }\n```\n\nThe table is computed at compile time and stored in `.rodata`, so there is no runtime initialisation. At runtime each use is a single load from a tiny table that stays in L1 (~1 ns) plus a multiply, instead of calling `std::pow` (tens of ns, floating point, rounding issues) or a loop. `static_assert` also checks the values at compile time.",
+   "explanation": "constexpr computation, where the data lives, and why a load beats recomputation.",
+   "id": "L11-s4"
+  },
+  {
+   "q": "Describe the measure, find hot spot, optimise loop you would apply to a slow order-book update loop, naming the tools and what you would look at.",
+   "checks": [
+    {
+     "label": "Measure first / baseline",
+     "patterns": [
+      "measure",
+      "baseline"
+     ]
+    },
+    {
+     "label": "Uses perf record/report or gprof",
+     "patterns": [
+      "perf record",
+      "perf report",
+      "gprof"
+     ]
+    },
+    {
+     "label": "Uses counters: perf stat / cache misses / branch misses / IPC",
+     "patterns": [
+      "perf stat",
+      "cache[- ]miss",
+      "branch[- ]miss",
+      "\\bIPC\\b"
+     ]
+    },
+    {
+     "label": "Identifies hot spot",
+     "patterns": [
+      "hot ?spot",
+      "hottest",
+      "hot path"
+     ]
+    },
+    {
+     "label": "Re-measure / verify",
+     "patterns": [
+      "re-?measure",
+      "measure again",
+      "verify"
+     ]
+    }
+   ],
+   "modelAnswer": "1. Measure a baseline on realistic data: build with the production flags (`-O2/-O3 -g`), replay a day of market data, record the per-update latency distribution (p50, p99, p99.9) with `steady_clock` or `rdtsc`, warm up and pin the thread.\n2. Find the hot spot: `perf record -g ./book` then `perf report` (or gprof with `-pg`) to see which function dominates, and `perf annotate` for the hottest instructions.\n3. Understand why: `perf stat -e cycles,instructions,cache-misses,branch-misses` shows IPC. Low IPC with many cache misses points at pointer chasing in `std::map` levels; many branch misses point at data-dependent branches; `malloc` in the profile points at per-order allocation.\n4. Optimise one thing: e.g. replace the map with a flat array/vector of levels, pre-allocate orders in a pool, remove virtual calls, hoist invariants.\n5. Re-measure and verify correctness against the old version; keep the change only if the numbers improve. Remember Amdahl's law: only the hot spot matters.",
+   "explanation": "A disciplined, tool-backed workflow rather than guessing.",
+   "id": "L11-s5"
+  },
+  {
+   "q": "List what -O3 adds over -O2 and explain why -O3 is not always faster.",
+   "checks": [
+    {
+     "label": "Mentions vectorisation",
+     "patterns": [
+      "vectori[sz]",
+      "SIMD"
+     ]
+    },
+    {
+     "label": "Mentions aggressive inlining or unrolling/peeling",
+     "patterns": [
+      "inlin",
+      "unroll",
+      "peel"
+     ]
+    },
+    {
+     "label": "Code size / I-cache downside",
+     "patterns": [
+      "code (size|bloat)",
+      "I-?cache",
+      "instruction cache",
+      "bloat"
+     ]
+    },
+    {
+     "label": "Must measure",
+     "patterns": [
+      "measure",
+      "benchmark",
+      "profile"
+     ]
+    }
+   ],
+   "modelAnswer": "`-O3` adds to `-O2`: more aggressive inlining, full auto-vectorisation (SIMD) of loops, loop unswitching, loop peeling / full unrolling of small loops, and function cloning for constant arguments (GCC 12+ already does cheap vectorisation at -O2).\n\nIt is not always faster because those transformations grow the code: bigger hot paths mean more I-cache and iTLB misses, vectorised loops have prologue/epilogue overhead that hurts short trip counts, and unswitching duplicates loops. On branchy, latency-critical code (typical in trading) -O2 can win. You have to benchmark and profile both on real workloads; PGO often helps more than -O3.",
+   "explanation": "Know the concrete passes and the code-bloat trade-off.",
+   "id": "L11-s6"
+  }
+ ],
+ "quiz": [],
+ "coding": [
+  {
+   "id": "constexpr-crtp",
+   "title": "Compile-Time Tables and CRTP Dispatch"
+  }
+ ],
+ "prev": {
+  "num": 10,
+  "file": "lecture-10.html"
+ },
+ "next": {
+  "num": 12,
+  "file": "lecture-12.html"
+ }
+};

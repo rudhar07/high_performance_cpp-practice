@@ -1,0 +1,991 @@
+window.PAGE = {
+ "num": 6,
+ "title": "Metaprogramming and Move Semantics",
+ "summary": "Why value semantics used to mean expensive deep copies, and how C++11 fixed it: value categories, std::move, forwarding references, reference collapsing and std::forward (with the class's own Forward/Remove_Ref and custom String/vector). Then the Rule of 3/5/0, SSO, SFINAE and C++20 concepts, type traits built by specialisation, RVO/NRVO, compiler-friendly habits, and a first look at unique_ptr/shared_ptr and the control block.",
+ "notes": [
+  {
+   "heading": "The problem: copies C++ ends up making without good compilers (and before C++11)",
+   "body": "Value semantics means `a = b` and `return x` make **copies**. For a type that owns heap memory (a string, a vector of orders, a 1 GB price buffer) a copy means `new` + `memcpy` + later `delete`: microseconds, cache pollution, and allocator contention. Before C++11 the language had no way to say \"this object is about to die, just steal its buffer\", so:\n\n- Returning a big `std::vector` by value was a **deep copy** unless the compiler happened to apply RVO.\n- `v.push_back(std::string(...))` copied the temporary and then destroyed it.\n- Growing a `vector<std::string>` copied every string into the new buffer.\n- People contorted APIs into out-parameters (`void build(std::vector<Order>& out)`), and `std::auto_ptr` \"moved\" on copy, which broke containers.\n\nC++11 added **rvalue references** (`T&&`) and **move semantics**: overload on \"this argument is a temporary\" and transfer ownership with a few pointer assignments.\n\n**In class (Lec-8, custom String):** we built a heap-backed `String` (`char* mPtr; uint mSize;`) and a `concat()` that returns `String(\"…\")` by value, then disassembled it with `objdump -d -M intel`. The listing shows the real cost model:\n\n```cpp\n// concat():  call String::String(char const*)     ; build the temporary at [rbp-0x30]\n//            call String::String(String&&)         ; move it into the hidden return slot (rdi)\n//            call String::~String()                ; destroy the temporary\n// main():    call concat(...)                      ; result lands in another temporary\n//            call String::String(String&&)         ; move again into c\n```\n\nThe return slot is passed as a hidden pointer in `rdi`: the *caller* reserves the stack space for the result. Two move constructor calls appear because that build had copy elision turned off (as with `-std=c++14 -fno-elide-constructors` at `-O0`). Compiled as plain C++17, `return String(\"…\")` and `String c{concat(a, b)}` are **guaranteed elisions**: the program prints only three \"const* params constructor\" lines and three destructors, with zero moves. \"Loving the compiler\" means knowing what it will elide for you."
+  },
+  {
+   "heading": "L-values and R-values (value categories)",
+   "body": "Every expression has a type **and** a value category:\n\n| Category | Meaning | Examples |\n|---|---|---|\n| **lvalue** | has identity, can't be moved from implicitly | `x`, `*p`, `arr[i]`, `std::cout`, a function returning `T&`, **a named rvalue reference** |\n| **prvalue** (pure rvalue) | a temporary value with no identity | `42`, `x + 1`, `String(\"abc\")`, a function returning `T` by value |\n| **xvalue** (expiring) | has identity but is marked as movable | `std::move(x)`, a function returning `T&&`, `std::move(obj).member` |\n\nglvalue = lvalue + xvalue; rvalue = prvalue + xvalue. Rule of thumb: **if it has a name, it's an lvalue**, even if its type is `T&&`.\n\nBinding rules:\n\n| | lvalue | rvalue |\n|---|---|---|\n| `T&` | yes | **no** |\n| `const T&` | yes | yes (extends a temporary's lifetime) |\n| `T&&` | **no** | yes |\n\n```cpp\nvoid f(String& s);        // (1)\nvoid f(const String& s);  // (2)\nvoid f(String&& s);       // (3)\nString a(\"x\");\nf(a);             // (1)\nf(String(\"y\"));   // (3): prvalue prefers && over const&\nf(std::move(a));  // (3)\nString&& r = String(\"z\");\nf(r);             // (1)! r has a name, so it's an lvalue\n```"
+  },
+  {
+   "heading": "std::move: just a cast",
+   "body": "`std::move` doesn't move anything. It's an unconditional cast to an rvalue reference, which makes overload resolution pick the move constructor/assignment:\n\n```cpp\ntemplate <typename T>\nconstexpr std::remove_reference_t<T>&& move(T&& t) noexcept {\n    return static_cast<std::remove_reference_t<T>&&>(t);\n}\n```\n\nThe **move constructor** does the actual work (steals pointers). After a move, the source is in a **valid but unspecified state**: you may destroy it or assign to it; don't read its value. (Standard types leave a moved-from `std::string`/`std::vector` empty in practice; `std::unique_ptr` is guaranteed null.)\n\nTraps:\n- `std::move` on a **const** object yields `const T&&`, which binds to the **copy** constructor `T(const T&)`, so it silently copies.\n- `std::move` of an `int` or a trivially copyable struct is a plain copy; moving only helps when there's a resource (heap buffer, file descriptor) to steal.\n- Using a moved-from object (`std::move(v); v.size()` is fine only because `vector` defines it; logic that expects the old contents is a bug)."
+  },
+  {
+   "heading": "Universal (forwarding) references and reference collapsing",
+   "body": "`T&&` is a **forwarding (universal) reference** only when `T` is being **deduced** at that point: `template<class T> void f(T&& x)` or `auto&& x = …`. It binds to anything and remembers whether the argument was an lvalue or rvalue in `T`.\n\nNot forwarding references (just rvalue references):\n- `void f(String&& s)` (no deduction)\n- `template<class T> void f(std::vector<T>&& v)` (the form is `vector<T>&&`, not `T&&`)\n- `template<class T> void f(const T&& x)` (const kills it)\n- inside `template<class T> class Box { void put(T&& x); }`: `T` is already fixed by the class\n\n**Reference collapsing** (only the compiler can form references to references, during deduction/typedefs):\n\n| Combination | Result |\n|---|---|\n| `T& &` | `T&` |\n| `T& &&` | `T&` |\n| `T&& &` | `T&` |\n| `T&& &&` | `T&&` |\n\nAny lvalue reference wins. So with `f(x)` (lvalue): `T = int&`, param `int& && = int&`. With `f(5)`: `T = int`, param `int&&`."
+  },
+  {
+   "heading": "std::forward and perfect forwarding",
+   "body": "Inside `template<class T> void wrapper(T&& arg)`, `arg` is a **named** variable, so it's always an lvalue. To pass it on with its **original** category, use `std::forward<T>(arg)`: a **conditional** cast to rvalue that fires only if the caller passed an rvalue (`T` is a non-reference type).\n\n**In class (Lec-8 `utils.h` + `checking.cpp`):** we wrote our own `Forward` on top of our `Remove_Ref` trait:\n\n```cpp\ntemplate <typename T>\nT&& Forward(typename Remove_Ref<T>::type& obj) { return static_cast<T&&>(obj); }\n\nstruct X {\n    void print() const &  { std::cout << \"L value\\n\"; }   // ref-qualified overloads\n    void print() const && { std::cout << \"R value\\n\"; }\n};\ntemplate <typename T> void func(T&& obj) { utils::Forward<T>(obj).print(); }\n\nconst X a;\nfunc(a);      // T = const X&  -> Forward returns const X&  -> \"L value\"\nfunc(X{});    // T = X         -> Forward returns X&&       -> \"R value\"\n```\n\nWhy the parameter is `typename Remove_Ref<T>::type&`: it's a **non-deduced context**, which forces you to spell `Forward<T>` explicitly. If `T` were deduced from the argument, it would always see an lvalue. (The real `std::forward` also has an rvalue overload, plus `constexpr` and `noexcept`.) Without forwarding, `obj.print()` always prints \"L value\".\n\nPerfect forwarding in the standard library: `emplace_back(Args&&...)`, `std::make_unique<T>(Args&&...)`, `std::thread`'s constructor:\n\n```cpp\ntemplate <typename T, typename... Args>\nT* construct_in_pool(void* slot, Args&&... args) {\n    return ::new (slot) T(std::forward<Args>(args)...);   // each arg keeps its category\n}\n```\n\n**`std::move` vs `std::forward`:** move = *unconditional* cast to rvalue (use it on things you own and are done with). forward = *conditional* cast (use it only on forwarding references, exactly once per path)."
+  },
+  {
+   "heading": "Real example: our own std::vector<> and why moves matter",
+   "body": "**In class (Lec-9 `main.cpp`):** a templated `vector<T>` with `mSize`, `mCapacity` (starts at 4) and `T* mData`, plus:\n- a copy constructor that prints \"COPY CONSTRUCTOR VERY COSTLY\" and allocates and copies every element (**deep copy**, O(n));\n- a move constructor that prints \"SHALLOW COPY CONSTRUCTION VERY CHEAP\", takes `other.mData`, `mSize`, `mCapacity` and sets `other` to `nullptr`/0 (**O(1)**, three loads and stores, no allocation);\n- `makeVector()` returning a local by value, and `func(T&& temp)` that builds `vector<int> b(std::forward<T>(temp));`, so it picks copy or move depending on the caller.\n\nWhat it prints: in C++17 at default settings, `vector<int> a(makeVector());` prints three \"PUSH\" lines and `3` with **no** copy/move message (NRVO in `makeVector`, guaranteed elision for the prvalue). With `-fno-elide-constructors` the cheap move constructor shows up (once in C++17, twice in C++14).\n\nBugs in the class sketch worth spotting in an exam:\n\n| Bug | Fix |\n|---|---|\n| Copy ctor takes `const vector<int>&` inside `vector<T>` | `const vector& other` (or `vector<T>`) |\n| Copy loop runs `for (i < mSize)` **before** setting `mSize`, so it copies nothing (`mSize` is 0) | assign `mSize = other.mSize` first, or loop to `other.mSize` |\n| No destructor: `mData` leaks | `~vector() { delete[] mData; }` |\n| No copy/move assignment: defaults would do a shallow pointer copy, which is a double `delete[]` once a destructor exists | Rule of 5 (or copy-and-swap) |\n| `pop_back` calls `mData[mSize].~T()` (one past the last element), and an explicit `~T()` on an element of `new T[]` is destroyed again by `delete[]` | `--mSize; mData[mSize].~T();` with raw storage plus placement new (that's what `std::vector` does) |\n| `throw;` with no active exception calls `std::terminate` | throw a real exception or assert |\n| `push_back` when full just returns | allocate 2x, **move** elements over, free the old buffer |\n| Move constructor isn't `noexcept` | mark it `noexcept` (see below) |\n\n**Why `noexcept` on the move constructor is a performance feature:** on reallocation, `std::vector` must keep the strong exception guarantee, so it uses `std::move_if_noexcept`: it moves elements only if the move constructor is `noexcept` (or the type can't be copied), otherwise it **copies** every element. A `vector<Order>` whose `Order(Order&&)` lacks `noexcept` deep-copies on every growth."
+  },
+  {
+   "heading": "Rule of 0, 3 and 5 (a std::string-like class)",
+   "body": "If a class manages a resource, the compiler-generated special members do the wrong (shallow) thing.\n\n- **Rule of 3 (C++98):** if you need any of destructor, copy constructor, copy assignment, you need all three.\n- **Rule of 5 (C++11):** add move constructor and move assignment. Declaring a destructor or copy op **suppresses the implicit move operations** (moves silently fall back to copies).\n- **Rule of 0:** best of all, hold resources in members that already manage themselves (`std::string`, `std::vector`, `std::unique_ptr`) and declare none of the five.\n\n```cpp\nclass String {\n    std::size_t mSize = 0;          // declared first: mPtr's initialiser uses mSize\n    char*       mPtr  = nullptr;\npublic:\n    String() = default;\n    String(const char* s) : mSize(std::strlen(s)), mPtr(new char[mSize + 1]) {\n        std::memcpy(mPtr, s, mSize + 1);                       // keep the '\\0'\n    }\n    ~String() { delete[] mPtr; }                               // 1. destructor\n    String(const String& o) : mSize(o.mSize), mPtr(new char[o.mSize + 1]) {\n        std::memcpy(mPtr, o.mPtr, mSize + 1);                  // 2. deep copy\n    }\n    String(String&& o) noexcept                                // 4. steal\n        : mSize(std::exchange(o.mSize, 0)), mPtr(std::exchange(o.mPtr, nullptr)) {}\n    String& operator=(String o) noexcept {                     // 3 + 5: copy-and-swap,\n        swap(o); return *this;                                 // by-value param = copy OR move\n    }\n    void swap(String& o) noexcept { std::swap(mPtr, o.mPtr); std::swap(mSize, o.mSize); }\n};\n```\n\n(Watch the member order: members are initialised in **declaration order**, not initialiser-list order. If `mPtr` were declared first, `new char[mSize + 1]` would read an uninitialised `mSize`; `-Wreorder` warns about mismatched lists.)\n\nCopy-and-swap gives the strong exception guarantee and handles self-assignment for free; the cost is one extra move. A hand-written `operator=(const String&)` must check `this != &o`, allocate **before** freeing (exception safety), then `delete[]` the old buffer.\n\n**In class (Lec-8):** the custom String had a copy constructor and a move constructor but (a) the move ctor wrote `other->mSize` (`other` is a reference, so it must be `other.mSize`: compile error as written), (b) the destructor only nulled the pointer and **never called `delete[]`** (a leak), (c) no copy/move assignment, so `s1 = s2` would shallow-copy the pointer, (d) it used `uint` (a POSIX typedef; use `std::size_t`/`uint32_t`) and stored no `'\\0'`."
+  },
+  {
+   "heading": "SSO: small string optimisation",
+   "body": "A `std::string` is not just a pointer: it keeps a small **inline buffer** inside the object so that short strings (symbols like \"AAPL\", order IDs) need **no heap allocation**.\n\n| Library | `sizeof(std::string)` | Inline capacity |\n|---|---|---|\n| libstdc++ (GCC, Linux) | 32 bytes | 15 chars |\n| libc++ (Clang, macOS) | 24 bytes | 22 chars |\n| MSVC | 32 bytes | 15 chars |\n\nlibstdc++ layout: `char* ptr; size_t size; union { size_t capacity; char buf[16]; }`, where `ptr` points into `buf` for short strings.\n\nConsequences:\n- Creating and copying short strings is cheap: no `new`, data on the same cache line as the object.\n- **Moving an SSO string is not cheaper than copying it**: the bytes must be copied (there's no pointer to steal), and the source is reset. Moves only win for long (heap) strings.\n- Crossing the threshold (16th char on libstdc++) triggers an allocation: a latency spike on the hot path.\n- `std::string_view` (pointer + length, 16 bytes) avoids copies entirely for read-only parameters.\n- HFT code often uses fixed-size `char sym[8]` or a `uint64_t`-packed symbol to make comparisons a single integer compare."
+  },
+  {
+   "heading": "SFINAE",
+   "body": "**Substitution Failure Is Not An Error:** when substituting template arguments into a function template's **signature** fails, that overload is silently removed from the candidate set instead of causing an error. It's used to enable or disable overloads by type properties.\n\n```cpp\n// integral prices: exact arithmetic\ntemplate <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>\nT midPrice(T bid, T ask) { return bid + (ask - bid) / 2; }\n\n// floating prices\ntemplate <typename T, std::enable_if_t<std::is_floating_point_v<T>, int> = 0>\nT midPrice(T bid, T ask) { return (bid + ask) * 0.5; }\n\n// detection idiom: does T have .size()?\ntemplate <typename, typename = void> struct HasSize : std::false_type {};\ntemplate <typename T>\nstruct HasSize<T, std::void_t<decltype(std::declval<T&>().size())>> : std::true_type {};\n```\n\n`std::enable_if<cond, T>::type` exists only when `cond` is true, so a false condition makes substitution fail. `std::declval<T>()` pretends to produce a `T` in unevaluated contexts (`decltype`, `sizeof`) without needing a constructor.\n\nOnly the **immediate context** (the signature, template parameter defaults, the return type) is SFINAE-friendly. An error **inside the function body** is a hard error."
+  },
+  {
+   "heading": "Concepts (C++20)",
+   "body": "Concepts are named compile-time predicates on template parameters: readable SFINAE with much better error messages.\n\n```cpp\n#include <concepts>\ntemplate <typename T>\nconcept PriceType = std::integral<T> || std::floating_point<T>;\n\ntemplate <typename V>\nconcept Venue = requires(V v, const Order& o) {\n    { v.send(o) } -> std::same_as<void>;     // must have send(const Order&)\n    { v.name() }  -> std::convertible_to<std::string_view>;\n};\n\ntemplate <Venue V>                       // constrained template parameter\nvoid postOrder(V& v, const Order& o) { v.send(o); }\n\nvoid logPx(PriceType auto px);           // abbreviated function template\n\ntemplate <typename T> requires std::movable<T>\nclass RingBuffer { /* ... */ };\n```\n\nBenefits over SFINAE: an error says \"constraint `Venue<Foo>` not satisfied because `v.send(o)` is invalid\" instead of 200 lines of instantiation backtrace; overloads constrained by more specific concepts are **preferred automatically** (subsumption); zero runtime cost. Useful standard concepts: `std::integral`, `std::floating_point`, `std::same_as`, `std::convertible_to`, `std::movable`, `std::copyable`, `std::invocable`, `std::ranges::range`."
+  },
+  {
+   "heading": "Type traits by template specialisation: is_move_constructible, is_destructible",
+   "body": "Type traits are class templates whose `::value` is computed at compile time using **specialisation** and SFINAE. Writing them is a standard interview question.\n\n```cpp\n// is_same: primary false, partial specialisation true\ntemplate <class A, class B> struct is_same       : std::false_type {};\ntemplate <class A>          struct is_same<A, A> : std::true_type {};\n\n// is_destructible (simplified, for object types): is `declval<T&>().~T()` well-formed?\ntemplate <class T, class = void>\nstruct is_destructible : std::false_type {};\ntemplate <class T>\nstruct is_destructible<T, std::void_t<decltype(std::declval<T&>().~T())>> : std::true_type {};\n\n// is_move_constructible: can T be constructed from an rvalue T?\ntemplate <class T>\nstruct is_move_constructible : std::is_constructible<T, T&&> {};\n// is_constructible itself is detected with decltype(::new T(std::declval<Args>()...))\n```\n\nWhat they really mean:\n- `is_move_constructible<T>` is **true for a copy-only type** too: `T(const T&)` happily binds an rvalue. It's false only if the move ctor is **deleted** (or the copy ctor is unusable as well).\n- `is_nothrow_move_constructible<T>` is what `std::vector` checks before choosing to move on reallocation.\n- `is_destructible<T>` is false for `void`, functions, arrays of unknown bound and types with a deleted/private destructor; true for references.\n- `is_trivially_copyable<T>` tells you `memcpy` is safe: this is how you write a fast serializer path.\n\nUse them in `static_assert` to lock in performance guarantees:\n\n```cpp\nstatic_assert(std::is_nothrow_move_constructible_v<Order>, \"Order must move cheaply\");\nstatic_assert(std::is_trivially_copyable_v<MdMsg>, \"MdMsg is sent with memcpy\");\n```"
+  },
+  {
+   "heading": "RVO and NRVO",
+   "body": "**RVO (Return Value Optimisation):** returning a **prvalue** (`return String(\"x\");`). Since **C++17 this is guaranteed** (\"mandatory copy elision\"): the object is constructed directly in the caller's storage (the hidden return-slot pointer in `rdi`). No copy or move constructor is called, and the type doesn't even need one.\n\n**NRVO (Named RVO):** returning a **named local** (`File a; … return a;`). It's **allowed but not guaranteed**; GCC/Clang do it whenever there's a single object returned on all paths. If it doesn't happen, the return is an **implicit move** (since C++11 a returned local is treated as an rvalue first), so you still don't copy.\n\n**In class (Lec-9 `second.cpp`):** the instructor contrasted `return File({47674}, \"...\")` (RVO, an unnamed temporary) with `File a; /* use */ return a;` (NRVO) and `File a = construct();` in `main`.\n\nWhen NRVO fails:\n\n```cpp\nS pick(bool b) { S a, c; if (b) return a; return c; }  // two named candidates -> move\nS fromParam(S p) { return p; }                         // parameters are never elided -> implicit move\nS fromMember()   { return this->member; }              // a member: COPY (not a local)\nS bad() { S s; return std::move(s); }                  // pessimisation: blocks NRVO, forces a move\n```\n\nRules for exams:\n1. **Never write `return std::move(local);`** (GCC/Clang warn with `-Wpessimizing-move`).\n2. Prefer one named result variable or returning prvalues.\n3. Check with `-fno-elide-constructors` to see where copies/moves would happen, and on Compiler Explorer look for calls to `String(String&&)`."
+  },
+  {
+   "heading": "Healthy C++ tricks: loving the compiler more",
+   "body": "- **Return by value**: RVO/NRVO/implicit move make it the cheapest and clearest option. Out-params are a pre-C++11 habit.\n- **Mark moves `noexcept`** (and `= default` them where possible) so containers move instead of copy.\n- **Sink parameters:** for a constructor that stores its argument, take it **by value and move** it: one copy for lvalues, zero for rvalues.\n\n```cpp\nstruct Instrument {\n    std::string sym;\n    explicit Instrument(std::string s) : sym(std::move(s)) {}\n};\n```\n\n- Read-only parameters: `const T&` (or `std::string_view` / `std::span`).\n- `reserve()` before a known number of `push_back`s; `emplace_back(args...)` constructs in place (no temporary).\n- Don't `std::move` a `const` object, and don't `std::move` the return of a local.\n- Let the compiler tell you: `-Wall -Wextra -Wpessimizing-move -Wredundant-move`, sanitizers (`-fsanitize=address,undefined`), and Compiler Explorer to read the generated assembly.\n- Use `static_assert` with type traits to make performance assumptions compile-time checks.\n- `[[nodiscard]]` on functions whose result must not be ignored (e.g. `bool tryPush`)."
+  },
+  {
+   "heading": "unique_ptr and shared_ptr (first look; the control block)",
+   "body": "- `std::unique_ptr<T>`: **sole ownership**, move-only (copy is deleted), `sizeof` = one raw pointer (8 bytes) with the default deleter, and `->` costs the same as a raw pointer. It's what you hand out from factories: `auto o = std::make_unique<Order>(id, px, qty);`.\n- `std::shared_ptr<T>`: **shared ownership** with reference counting. `sizeof` = **16 bytes** (pointer to the object plus a pointer to the **control block**).\n\nThe **control block** is a separate heap object holding:\n1. the **strong count** (number of `shared_ptr` owners; when it hits 0 the object is destroyed),\n2. the **weak count** (number of `weak_ptr`s, +1 while any strong owner exists; when it hits 0 the block itself is freed),\n3. the **deleter** and allocator (type-erased),\n4. with `make_shared`, the object itself is stored in the same allocation.\n\nCopying a `shared_ptr` does an **atomic increment** (`lock xadd`), and destroying one does an atomic decrement: roughly 5–20 ns uncontended, far more when threads bounce the counter's cache line. `make_shared<T>(…)` does **one** allocation instead of two (object + control block) and keeps them adjacent in cache. Session 7 builds both from scratch."
+  },
+  {
+   "heading": "Quick revision",
+   "body": "- lvalue = has a name/identity; prvalue = pure temporary; xvalue = `std::move(x)`. A named `T&&` is an lvalue.\n- `T&` binds lvalues, `const T&` binds both, `T&&` binds rvalues.\n- `std::move` = `static_cast<remove_reference_t<T>&&>`; the move constructor does the stealing.\n- Moved-from objects are valid but unspecified: destroy or reassign them.\n- `std::move` on a const object copies.\n- `T&&` is a forwarding reference only when `T` is deduced right there (also `auto&&`).\n- Reference collapsing: any `&` wins; only `&& &&` gives `&&`.\n- `std::forward<T>(x)`: conditional cast that restores the caller's value category; use it once per forwarding reference.\n- Rule of 3/5: a resource-owning class needs destructor, copy ctor/assign, move ctor/assign; Rule of 0 is better.\n- Declaring a destructor or copy op suppresses the implicit move ops.\n- Copy-and-swap: `T& operator=(T other) noexcept { swap(other); return *this; }`.\n- SSO: libstdc++ string is 32 B with 15 inline chars; libc++ is 24 B with 22; moving a short string still copies bytes.\n- SFINAE: substitution failure in the signature removes the overload; errors in the body are hard errors.\n- Concepts: `template<std::integral T>`, `requires` expressions, better errors, subsumption.\n- `is_move_constructible<T>` = `is_constructible<T, T&&>`: true for copy-only types.\n- `vector` moves on growth only if the move ctor is `noexcept` (move_if_noexcept).\n- C++17: returning a prvalue is guaranteed elision; NRVO is optional; never `return std::move(local)`.\n- `shared_ptr` = 16 B + a control block (strong count, weak count, deleter); copies are atomic increments."
+  },
+  {
+   "heading": "Exam traps",
+   "body": "- `void f(Order&& o) { store(o); }` copies: `o` has a name, so it's an lvalue. Write `store(std::move(o))`.\n- `template<class T> void f(std::vector<T>&& v)` is **not** a forwarding reference; it only binds rvalues.\n- `const std::string s = \"…\"; v.push_back(std::move(s));` copies (const&& binds to the copy ctor).\n- `return std::move(local);` is slower (it disables NRVO), not faster.\n- A class with a user-declared destructor and no move ops: `std::move(obj)` silently **copies**.\n- `std::forward` without the explicit template argument doesn't compile (non-deduced context by design).\n- Calling `std::forward<T>(x)` twice on the same argument can move from it twice: a use-after-move bug.\n- `is_move_constructible_v<T>` being true does **not** mean T has a move constructor.\n- A moved-from `std::string` is *usually* empty, but only \"valid but unspecified\" is guaranteed; `unique_ptr` is guaranteed null.\n- Member initialiser order follows **declaration order**, not the order in the initialiser list.\n- `-fno-elide-constructors` doesn't disable C++17 *guaranteed* elision, only NRVO and pre-C++17 elisions; that's why the class listing (built without guaranteed elision) shows two moves while C++17 shows none.\n- SSO: moving a short `std::string` is about as costly as copying it.\n- `shared_ptr` copies are thread-safe for the **count**, not for the pointed-to object."
+  }
+ ],
+ "keyTerms": [
+  {
+   "term": "lvalue",
+   "def": "An expression with identity (usually a name) that can't be implicitly moved from."
+  },
+  {
+   "term": "prvalue",
+   "def": "A pure temporary value such as `42` or `String(\"x\")`, with no identity."
+  },
+  {
+   "term": "xvalue",
+   "def": "An expiring value with identity, e.g. the result of `std::move(x)`."
+  },
+  {
+   "term": "Rvalue reference",
+   "def": "`T&&` (non-deduced): binds only to rvalues; used to detect movable temporaries."
+  },
+  {
+   "term": "Forwarding reference",
+   "def": "`T&&` with `T` deduced (or `auto&&`): binds to anything and records the category in `T`."
+  },
+  {
+   "term": "Reference collapsing",
+   "def": "Rule that a reference to a reference collapses to `&` unless both are `&&`."
+  },
+  {
+   "term": "std::move",
+   "def": "Unconditional cast to an rvalue reference; enables move overloads."
+  },
+  {
+   "term": "std::forward",
+   "def": "Conditional cast that restores an argument's original value category."
+  },
+  {
+   "term": "Move constructor",
+   "def": "`T(T&&) noexcept`: builds an object by stealing another's resources."
+  },
+  {
+   "term": "Rule of five",
+   "def": "A resource owner defines destructor, copy ctor, copy assignment, move ctor and move assignment."
+  },
+  {
+   "term": "Rule of zero",
+   "def": "Use self-managing members so no special member functions need to be written."
+  },
+  {
+   "term": "Copy-and-swap",
+   "def": "Assignment taking its parameter by value and swapping, giving strong exception safety."
+  },
+  {
+   "term": "SSO",
+   "def": "Small string optimisation: short strings stored inside the string object, no heap allocation."
+  },
+  {
+   "term": "SFINAE",
+   "def": "Substitution Failure Is Not An Error: overloads whose signature fails substitution are dropped."
+  },
+  {
+   "term": "Concept",
+   "def": "C++20 named compile-time predicate constraining template parameters."
+  },
+  {
+   "term": "std::declval",
+   "def": "Produces a `T&&` in unevaluated contexts without constructing a T."
+  },
+  {
+   "term": "RVO",
+   "def": "Constructing a returned prvalue directly in the caller's storage; guaranteed since C++17."
+  },
+  {
+   "term": "NRVO",
+   "def": "Eliding the copy/move of a returned named local; permitted but not guaranteed."
+  },
+  {
+   "term": "move_if_noexcept",
+   "def": "Casts to rvalue only if the move ctor is noexcept (or no copy exists); used by vector growth."
+  },
+  {
+   "term": "Control block",
+   "def": "shared_ptr's heap bookkeeping: strong count, weak count, deleter, allocator (and object with make_shared)."
+  }
+ ],
+ "mcqs": [
+  {
+   "q": "Which overload is called by `f(r)`?\n    void f(String&);  void f(const String&);  void f(String&&);\n    String&& r = String(\"z\");\n    f(r);",
+   "options": [
+    "f(const String&)",
+    "f(String&)",
+    "f(String&&)",
+    "Ambiguous: compile error"
+   ],
+   "answer": 1,
+   "explanation": "r has a name, so the expression `r` is an lvalue of type String, and the best match is the non-const lvalue reference.",
+   "distractors": "Its declared type is String&&, but value category depends on the expression, not on how the variable was declared.",
+   "source": "lecture",
+   "id": "L06-m1"
+  },
+  {
+   "q": "What does `std::move(x)` actually do at runtime?",
+   "options": [
+    "Copies x into a temporary",
+    "Sets x to its default state",
+    "Calls x's move constructor",
+    "Nothing by itself: it's a cast to an rvalue reference"
+   ],
+   "answer": 3,
+   "explanation": "std::move is just `static_cast<T&&>`; any moving is done by the move constructor or assignment that the cast lets overload resolution select.",
+   "distractors": "Constructors and resets happen only if the result is used to initialise or assign something.",
+   "source": "lecture",
+   "id": "L06-m2"
+  },
+  {
+   "q": "What does this print?\n    struct S { S() {} S(const S&) { std::cout << \"copy\"; } S(S&&) { std::cout << \"move\"; } };\n    const S cs;\n    S t = std::move(cs);",
+   "options": [
+    "copy",
+    "nothing",
+    "move",
+    "Compile error"
+   ],
+   "answer": 0,
+   "explanation": "std::move on a const object gives `const S&&`, which can't bind to `S&&` but can bind to `const S&`, so the copy constructor runs.",
+   "distractors": "There's no compile error because the copy constructor is a valid fallback; elision doesn't apply to an existing named object.",
+   "source": "lecture",
+   "id": "L06-m3"
+  },
+  {
+   "q": "In which declaration is `T&&` a forwarding (universal) reference?",
+   "options": [
+    "`template<class T> void f(std::vector<T>&& v);`",
+    "`template<class T> void f(const T&& x);`",
+    "`template<class T> void f(T&& x);`",
+    "`template<class T> struct Box { void put(T&& x); };`"
+   ],
+   "answer": 2,
+   "explanation": "Only the plain `T&&` form, with T deduced at that call, is a forwarding reference.",
+   "distractors": "vector<T>&& and const T&& are plain rvalue references, and in a class member T is already fixed by the class.",
+   "source": "lecture",
+   "id": "L06-m4"
+  },
+  {
+   "q": "With `template<class T> void f(T&& p);` and `int x;`, what is the type of `p` in `f(x)`?",
+   "options": [
+    "int&& (no collapsing happens)",
+    "int",
+    "int&",
+    "const int&"
+   ],
+   "answer": 2,
+   "explanation": "T is deduced as int&, and `int& &&` collapses to `int&`.",
+   "distractors": "int&& would be the result for an rvalue argument.",
+   "source": "lecture",
+   "id": "L06-m5"
+  },
+  {
+   "q": "In class we wrote `func(T&& obj) { utils::Forward<T>(obj).print(); }` with `print() const &` printing \"L value\" and `print() const &&` printing \"R value\". What does `const X a; func(a); func(X{});` print?",
+   "options": [
+    "L value, R value",
+    "R value, R value",
+    "L value, L value",
+    "R value, L value"
+   ],
+   "answer": 0,
+   "explanation": "For the lvalue a, T = const X&, so Forward returns an lvalue: L value. For the prvalue X{}, T = X and Forward returns X&&: R value.",
+   "distractors": "L value, L value is what you'd get by calling obj.print() directly, without forwarding.",
+   "source": "lecture",
+   "id": "L06-m6"
+  },
+  {
+   "q": "Why is `utils::Forward`'s parameter declared as `typename Remove_Ref<T>::type&` instead of `T&`?",
+   "options": [
+    "To make the function faster",
+    "To allow it to bind to rvalues only",
+    "Because references to references are illegal",
+    "To make T non-deduced, so callers must write Forward<T>(x) explicitly"
+   ],
+   "answer": 3,
+   "explanation": "A nested `::type` is a non-deduced context; if T were deduced from the named argument it would always see an lvalue and forwarding would be lost.",
+   "distractors": "It has nothing to do with speed and still binds lvalues; collapsing rules make references to references fine during deduction.",
+   "source": "lecture",
+   "id": "L06-m7"
+  },
+  {
+   "q": "Which is the best signature for a constructor that **stores** a string member (an \"Instrument\" storing its symbol)?",
+   "options": [
+    "`Instrument(std::string& s) : sym(s) {}`",
+    "`Instrument(std::string s) : sym(std::move(s)) {}`",
+    "`Instrument(std::string&& s) : sym(s) {}`",
+    "`Instrument(const std::string s) : sym(std::move(s)) {}`"
+   ],
+   "answer": 1,
+   "explanation": "A by-value sink plus move costs one copy for an lvalue argument and zero copies (just moves) for an rvalue.",
+   "distractors": "A const by-value parameter can't be moved from; `sym(s)` with a named `&&` copies; a non-const `&` rejects temporaries.",
+   "source": "lecture",
+   "id": "L06-m8"
+  },
+  {
+   "q": "A `std::vector<Order>` reallocates. `Order` has a user-written move constructor **without** `noexcept`, and a copy constructor. What does vector do with the existing elements?",
+   "options": [
+    "Moves them",
+    "Copies them",
+    "memcpy's them",
+    "Leaves them in place and links a new block"
+   ],
+   "answer": 1,
+   "explanation": "vector keeps the strong exception guarantee with move_if_noexcept: a throwing move could leave both buffers broken, so it copies when the move isn't noexcept and a copy exists.",
+   "distractors": "vector's storage must be contiguous, and memcpy is only used for trivially copyable types.",
+   "source": "lecture",
+   "id": "L06-m9"
+  },
+  {
+   "q": "Which class has **no** implicitly generated move constructor?",
+   "options": [
+    "`struct A { std::string s; };`",
+    "`struct B { std::vector<int> v; B() = default; };`",
+    "`struct D { std::unique_ptr<int> p; };`",
+    "`struct C { std::string s; ~C() {} };`"
+   ],
+   "answer": 3,
+   "explanation": "A user-declared destructor suppresses the implicit move constructor and move assignment, so `std::move(c)` falls back to the copy constructor.",
+   "distractors": "Declaring a default constructor doesn't affect moves; A, B and D get implicit memberwise moves.",
+   "source": "lecture",
+   "id": "L06-m10"
+  },
+  {
+   "q": "On GCC/libstdc++ (x86-64 Linux), what are `sizeof(std::string)` and its SSO capacity?",
+   "options": [
+    "32 bytes, 15 chars",
+    "24 bytes, 22 chars",
+    "16 bytes, 7 chars",
+    "8 bytes, 0 chars"
+   ],
+   "answer": 0,
+   "explanation": "libstdc++ stores a pointer, a size and a 16-byte union (capacity or inline buffer): 32 bytes, with 15 chars plus the '\\0' inline.",
+   "distractors": "24/22 is libc++ (Clang/macOS); a string is never just a single pointer.",
+   "source": "lecture",
+   "id": "L06-m11"
+  },
+  {
+   "q": "Why is moving a 5-character `std::string` not meaningfully cheaper than copying it?",
+   "options": [
+    "Because moves always call new",
+    "Because std::string has no move constructor",
+    "With SSO the characters live inside the object, so they have to be copied anyway; there's no heap pointer to steal",
+    "Because short strings are reference counted"
+   ],
+   "answer": 2,
+   "explanation": "A move only beats a copy when there's an external buffer to transfer; inline SSO bytes must be copied.",
+   "distractors": "std::string does have a noexcept move ctor, and C++11 forbids copy-on-write strings.",
+   "source": "lecture",
+   "id": "L06-m12"
+  },
+  {
+   "q": "What does SFINAE stand for and where does it apply?",
+   "options": [
+    "Substitution Failure Is Not An Error; anywhere in the function body",
+    "Static Function Inlining Not An Error; anywhere in the body",
+    "Substitution Failure Is Not An Error; only in the immediate context of the signature",
+    "Specialization First, Instantiation Next; only for class templates"
+   ],
+   "answer": 2,
+   "explanation": "Failed substitution in the declaration (parameter types, return type, default template args) removes the overload; errors in the body are hard errors.",
+   "distractors": "The body is not part of the immediate context, so the 'anywhere in the body' options are wrong.",
+   "source": "lecture",
+   "id": "L06-m13"
+  },
+  {
+   "q": "Which is a correct C++20 constrained function template accepting only integral prices?",
+   "options": [
+    "`template<class T> requires std::integral<T> T mid(T a, T b);`",
+    "`template<std::is_integral T> T mid(T a, T b);`",
+    "`template<class T> T mid(T a, T b) requires std::is_integral_v;`",
+    "`concept<int> T mid(T a, T b);`"
+   ],
+   "answer": 0,
+   "explanation": "A requires-clause with the std::integral concept is valid (as is `template<std::integral T>`).",
+   "distractors": "std::is_integral is a trait class, not a concept; is_integral_v needs a template argument; `concept<int>` isn't syntax.",
+   "source": "lecture",
+   "id": "L06-m14"
+  },
+  {
+   "q": "`struct NoMove { NoMove(const NoMove&); };` (copy constructor declared, move not declared). What is `std::is_move_constructible_v<NoMove>`?",
+   "options": [
+    "false: there's no move constructor",
+    "Compile error",
+    "Depends on optimisation level",
+    "true: an rvalue can bind to `const NoMove&`"
+   ],
+   "answer": 3,
+   "explanation": "The trait asks whether `NoMove(std::declval<NoMove&&>())` is well-formed; the copy constructor accepts it, so it's true. It would be false only if the move ctor were explicitly deleted.",
+   "distractors": "The trait tests constructibility from an rvalue, not the existence of a T(T&&) signature.",
+   "source": "lecture",
+   "id": "L06-m15"
+  },
+  {
+   "q": "Which `return` is a **guaranteed** elision in C++17?",
+   "options": [
+    "`S f() { S s; return s; }`",
+    "`S f() { return S(1, 2); }`",
+    "`S f(S p) { return p; }`",
+    "`S f() { S s; return std::move(s); }`"
+   ],
+   "answer": 1,
+   "explanation": "Returning a prvalue is mandatory copy elision in C++17: the object is constructed directly in the caller's storage.",
+   "distractors": "Returning a named local is optional NRVO; std::move blocks it; parameters are never elided (they're implicitly moved).",
+   "source": "lecture",
+   "id": "L06-m16"
+  },
+  {
+   "q": "Why is `return std::move(local);` a bad idea?",
+   "options": [
+    "It's UB",
+    "It disables NRVO and forces a move constructor call that would otherwise be elided",
+    "It copies instead of moving",
+    "It doesn't compile for move-only types"
+   ],
+   "answer": 1,
+   "explanation": "The expression is no longer just the name of a local, so NRVO can't apply; a plain `return local;` is either elided or implicitly moved anyway.",
+   "distractors": "It's legal and works for move-only types, it's just slower; it moves, not copies.",
+   "source": "lecture",
+   "id": "L06-m17"
+  },
+  {
+   "q": "In class, our custom String's objdump showed `concat()` calling `String(char const*)` then `String(String&&)`, and `main` calling `String(String&&)` again. Under default C++17 compilation, how many move-constructor calls does that program make?",
+   "options": [
+    "3",
+    "1",
+    "2",
+    "0"
+   ],
+   "answer": 3,
+   "explanation": "Both `return String(\"…\")` and `String c{concat(a,b)}` initialise from prvalues, which C++17 guarantees to elide; the listing came from a build without guaranteed elision.",
+   "distractors": "1 or 2 moves would only appear with -fno-elide-constructors and pre-C++17 rules.",
+   "source": "lecture",
+   "id": "L06-m18"
+  },
+  {
+   "q": "In class Lec-9 `vector`, the copy constructor runs `for (i = 0; i < mSize; ++i) mData[i] = other.mData[i];` and only then sets `mSize = other.mSize`. What's the effect?",
+   "options": [
+    "Copies nothing: mSize is still 0 during the loop, so the new vector has the right size but uninitialised contents",
+    "Copies one element too many",
+    "Correct deep copy",
+    "Infinite loop"
+   ],
+   "answer": 0,
+   "explanation": "Default member initialisers set mSize to 0, so the loop body never runs; then mSize is set, leaving garbage elements.",
+   "distractors": "The loop bound is 0, so it can neither overrun nor loop forever.",
+   "source": "lecture",
+   "id": "L06-m19"
+  },
+  {
+   "q": "What is stored in a `std::shared_ptr`'s control block?",
+   "options": [
+    "Only the pointer to the object",
+    "A mutex and the object copy",
+    "The strong count, weak count, deleter (and allocator); with make_shared, also the object",
+    "The vtable of the object"
+   ],
+   "answer": 2,
+   "explanation": "The control block holds both reference counts and the type-erased deleter/allocator; make_shared co-locates the object with it in one allocation.",
+   "distractors": "Counts are atomics, not mutexes, and the object's vtable is unrelated.",
+   "source": "lecture",
+   "id": "L06-m20"
+  },
+  {
+   "q": "What is `sizeof(std::shared_ptr<int>)` on x86-64 with GCC or Clang?",
+   "options": [
+    "4",
+    "8",
+    "16",
+    "24"
+   ],
+   "answer": 2,
+   "explanation": "Two pointers: one to the managed object and one to the control block.",
+   "distractors": "8 is unique_ptr with the default deleter; the counts live in the control block, not in the shared_ptr.",
+   "source": "lecture",
+   "id": "L06-m21"
+  }
+ ],
+ "msqs": [
+  {
+   "q": "Which expressions are rvalues (prvalue or xvalue)? (select all that apply)",
+   "options": [
+    "`x + 1`",
+    "`42`",
+    "`x` where `int&& x = 5;`",
+    "`*p`",
+    "`std::move(x)`"
+   ],
+   "answers": [
+    0,
+    1,
+    4
+   ],
+   "explanation": "Literals and arithmetic results are prvalues, std::move(x) is an xvalue. A named rvalue reference is an lvalue, and dereferencing gives an lvalue.",
+   "id": "L06-x1"
+  },
+  {
+   "q": "Which are forwarding (universal) references? (select all that apply)",
+   "options": [
+    "`template<class T> void f(T&& x);`",
+    "`template<class T> void f(const T&& x);`",
+    "`auto&& r = expr;`",
+    "`void f(Order&& o);`",
+    "`template<class... Ts> void f(Ts&&... xs);`"
+   ],
+   "answers": [
+    0,
+    2,
+    4
+   ],
+   "explanation": "T&&, auto&& and a pack Ts&&... with deduction are forwarding references. A concrete Order&& and const T&& are plain rvalue references.",
+   "id": "L06-x2"
+  },
+  {
+   "q": "Which reference-collapsing results are correct? (select all that apply)",
+   "options": [
+    "`int&& &&` becomes `int&&`",
+    "`int&& &` becomes `int&&`",
+    "`int& &&` becomes `int&`",
+    "`int& &` becomes `int&`"
+   ],
+   "answers": [
+    0,
+    2,
+    3
+   ],
+   "explanation": "Any lvalue reference in the pair wins, so only && && collapses to &&; `int&& &` collapses to int&.",
+   "id": "L06-x3"
+  },
+  {
+   "q": "Which statements about std::move and std::forward are true? (select all that apply)",
+   "options": [
+    "std::move is an unconditional cast to an rvalue reference",
+    "std::move on a const object usually ends up calling the copy constructor",
+    "std::forward<T>(x) casts to rvalue only when T is a non-reference type (caller passed an rvalue)",
+    "std::move frees the source object's memory",
+    "std::forward deduces T automatically from its argument"
+   ],
+   "answers": [
+    0,
+    1,
+    2
+   ],
+   "explanation": "move always casts, forward casts conditionally, and const&& binds the copy ctor. forward's parameter is a non-deduced context so you must write the T, and move frees nothing.",
+   "id": "L06-x4"
+  },
+  {
+   "q": "A class owns a raw `char*` buffer from `new[]`. Which special members must it handle correctly to follow the Rule of 5? (select all that apply)",
+   "options": [
+    "Destructor",
+    "Move assignment operator",
+    "Copy assignment operator",
+    "Default constructor",
+    "Copy constructor"
+   ],
+   "answers": [
+    0,
+    1,
+    2,
+    4
+   ],
+   "explanation": "The Rule of 5 is destructor, copy ctor, copy assignment, move ctor and move assignment. The default constructor isn't part of it.",
+   "id": "L06-x5"
+  },
+  {
+   "q": "Which bugs were present in the class's custom String (Lec-8)? (select all that apply)",
+   "options": [
+    "The move constructor used `other->mSize` on a reference",
+    "There was no copy assignment, so `a = b` would shallow-copy the pointer",
+    "It used a stack array instead of the heap",
+    "The copy constructor shared the source's pointer instead of allocating",
+    "The destructor never called `delete[]`, so the buffer leaked"
+   ],
+   "answers": [
+    0,
+    1,
+    4
+   ],
+   "explanation": "The move ctor's `->` doesn't compile on a reference, the destructor just nulled the pointer, and the missing assignment operators mean a memberwise (shallow) copy. The copy ctor did allocate and deep-copy, and the buffer was on the heap.",
+   "id": "L06-x6"
+  },
+  {
+   "q": "Which bugs are in the class's Lec-9 vector sketch? (select all that apply)",
+   "options": [
+    "No destructor, so mData leaks",
+    "`pop_back` destroys `mData[mSize]`, one past the last element",
+    "The move constructor deep-copies the elements",
+    "push_back when full returns silently instead of growing",
+    "`throw;` with no active exception calls std::terminate"
+   ],
+   "answers": [
+    0,
+    1,
+    3,
+    4
+   ],
+   "explanation": "All of those are real defects. The move constructor correctly steals the pointer and nulls the source: that part is right.",
+   "id": "L06-x7"
+  },
+  {
+   "q": "Which of these copy (rather than move or elide) the Order? (select all that apply)",
+   "options": [
+    "`const Order o = make(); v.push_back(std::move(o));`",
+    "`Order get() { return Order{1, 100}; }`",
+    "`void put(Order&& o) { v.push_back(o); }`",
+    "`v.push_back(std::move(order));` where order is a non-const local",
+    "`Order get() { return this->member; }` (member function)"
+   ],
+   "answers": [
+    0,
+    2,
+    4
+   ],
+   "explanation": "A named && parameter is an lvalue, std::move of a const object binds the copy ctor, and returning a member is a copy (members aren't implicitly moved). Moving a non-const local moves, and returning a prvalue is guaranteed elision.",
+   "id": "L06-x8"
+  },
+  {
+   "q": "Which statements about SSO (small string optimisation) are true? (select all that apply)",
+   "options": [
+    "Growing past the inline capacity triggers a heap allocation",
+    "On libstdc++ the inline capacity is 15 characters",
+    "Moving a short SSO string just steals a pointer and is O(1) with no byte copies",
+    "SSO makes sizeof(std::string) equal to sizeof(char*)",
+    "Short strings avoid heap allocation"
+   ],
+   "answers": [
+    0,
+    1,
+    4
+   ],
+   "explanation": "SSO stores short strings inline (15 chars on libstdc++) and allocates when they outgrow it. Moving a short string has to copy the inline bytes, and the object is 24–32 bytes, not 8.",
+   "id": "L06-x9"
+  },
+  {
+   "q": "Which situations prevent NRVO / elision for the returned object? (select all that apply)",
+   "options": [
+    "`return S(1, 2);`",
+    "Returning a function parameter by name",
+    "`return std::move(local);`",
+    "Returning one of two different named locals depending on a branch"
+   ],
+   "answers": [
+    1,
+    2,
+    3
+   ],
+   "explanation": "Multiple candidates, the std::move cast and function parameters all block elision (the last two still get a move). Returning a prvalue is guaranteed elision in C++17.",
+   "id": "L06-x10"
+  },
+  {
+   "q": "Which are true about SFINAE and concepts? (select all that apply)",
+   "options": [
+    "Concepts give clearer error messages and support subsumption",
+    "Concepts add a runtime check",
+    "`std::enable_if_t<cond, int> = 0` is a common SFINAE switch",
+    "An invalid expression inside the function body is also SFINAE",
+    "An invalid type in a function template's return type removes that overload"
+   ],
+   "answers": [
+    0,
+    2,
+    4
+   ],
+   "explanation": "SFINAE covers the immediate context (signature, return type, default template arguments), and enable_if is the usual tool; concepts improve errors and overload ordering. Body errors are hard errors, and concepts are purely compile time.",
+   "id": "L06-x11"
+  },
+  {
+   "q": "Which type-trait facts are correct? (select all that apply)",
+   "options": [
+    "`is_destructible<void>` is true",
+    "A copy-only type (no move ctor declared) is still move-constructible",
+    "Detection idioms use `std::void_t` and `std::declval`",
+    "`is_move_constructible<T>` is equivalent to `is_constructible<T, T&&>`",
+    "`is_same` is implemented with a partial specialisation `<A, A>`"
+   ],
+   "answers": [
+    1,
+    2,
+    3,
+    4
+   ],
+   "explanation": "These are the standard definitions and implementation techniques; is_destructible<void> is false because void objects can't exist.",
+   "id": "L06-x12"
+  },
+  {
+   "q": "Which statements about shared_ptr and unique_ptr are true? (select all that apply)",
+   "options": [
+    "unique_ptr with the default deleter is the size of a raw pointer",
+    "Copying a shared_ptr atomically increments the strong count",
+    "shared_ptr's reference count makes the pointed-to object thread-safe",
+    "unique_ptr is copyable",
+    "make_shared usually performs one allocation for object and control block"
+   ],
+   "answers": [
+    0,
+    1,
+    4
+   ],
+   "explanation": "unique_ptr is a zero-overhead pointer, shared_ptr copies do atomic increments, and make_shared co-allocates. unique_ptr is move-only, and the atomic count protects only the count, not the object.",
+   "id": "L06-x13"
+  }
+ ],
+ "short": [
+  {
+   "q": "Explain the difference between `std::move` and `std::forward`, and when you use each. Include how `std::forward` is implemented.",
+   "checks": [
+    {
+     "label": "move is an unconditional cast to rvalue",
+     "patterns": [
+      "move[\\s\\S]{0,80}unconditional",
+      "move[\\s\\S]{0,80}always[\\s\\S]{0,40}rvalue"
+     ]
+    },
+    {
+     "label": "forward is conditional, preserving the value category",
+     "patterns": [
+      "forward[\\s\\S]{0,120}(conditional|preserv|original (value )?category|restor)"
+     ]
+    },
+    {
+     "label": "forward is used with forwarding/universal references",
+     "patterns": [
+      "forwarding reference",
+      "universal reference",
+      "T\\s*&&"
+     ]
+    },
+    {
+     "label": "Implementation is a static_cast<T&&>",
+     "patterns": [
+      "static_cast\\s*<\\s*T\\s*&&\\s*>"
+     ]
+    },
+    {
+     "label": "Explicit template argument / non-deduced",
+     "patterns": [
+      "non[- ]deduced",
+      "explicit(ly)?[\\s\\S]{0,40}(template argument|<T>)",
+      "forward\\s*<\\s*T\\s*>"
+     ]
+    }
+   ],
+   "modelAnswer": "`std::move(x)` is an **unconditional** cast to an rvalue reference (`static_cast<std::remove_reference_t<T>&&>(x)`). Use it on an object you own and won't use again, to let a move constructor/assignment steal its resources.\n\n`std::forward<T>(x)` is a **conditional** cast: it returns an rvalue only if the original argument was an rvalue (T deduced as a non-reference type), so it **preserves the original value category**. Use it only inside a template on a **forwarding reference** `T&&` to pass the argument on unchanged (perfect forwarding: `emplace_back`, `make_unique`, wrappers).\n\n```cpp\ntemplate <class T>\nT&& forward(std::remove_reference_t<T>& x) noexcept { return static_cast<T&&>(x); }\n```\n\nIf T = `X&`, `T&&` collapses to `X&` (lvalue stays lvalue); if T = `X`, it's `X&&`. The parameter type is a **non-deduced** context, so you must write `std::forward<T>(x)` with the explicit template argument. That's exactly the `utils::Forward` we wrote in class on top of our `Remove_Ref` trait.",
+   "explanation": "Expect: unconditional vs conditional, forwarding references, static_cast<T&&> with collapsing, and the explicit T.",
+   "id": "L06-s1"
+  },
+  {
+   "q": "Implement the move constructor and move assignment for a class `Buffer { char* mData; std::size_t mSize; };` that owns `mData` (allocated with `new[]`). Explain each step.",
+   "checks": [
+    {
+     "label": "noexcept on the move operations",
+     "patterns": [
+      "noexcept"
+     ]
+    },
+    {
+     "label": "Steal the pointer",
+     "patterns": [
+      "mData\\s*(\\(|=|\\{)\\s*(other|o|rhs)\\.mData",
+      "exchange\\s*\\(\\s*(other|o|rhs)\\.mData"
+     ]
+    },
+    {
+     "label": "Null out the source",
+     "patterns": [
+      "(other|o|rhs)\\.mData\\s*=\\s*nullptr",
+      "exchange\\s*\\(\\s*(other|o|rhs)\\.mData\\s*,\\s*nullptr"
+     ]
+    },
+    {
+     "label": "Free the old buffer in assignment",
+     "patterns": [
+      "delete\\s*\\[\\s*\\]\\s*mData"
+     ]
+    },
+    {
+     "label": "Self-assignment check",
+     "patterns": [
+      "this\\s*!=\\s*&\\s*(other|o|rhs)",
+      "self[- ]assign"
+     ]
+    }
+   ],
+   "modelAnswer": "```cpp\nBuffer(Buffer&& other) noexcept\n    : mData(other.mData), mSize(other.mSize) {   // steal the pointer: O(1), no allocation\n    other.mData = nullptr;                        // leave the source empty but valid,\n    other.mSize = 0;                              // so its destructor's delete[] is a no-op\n}\n\nBuffer& operator=(Buffer&& other) noexcept {\n    if (this != &other) {                         // self-assignment check (x = std::move(x))\n        delete[] mData;                           // release what we currently own\n        mData = other.mData;                      // steal\n        mSize = other.mSize;\n        other.mData = nullptr;                    // reset the source\n        other.mSize = 0;\n    }\n    return *this;\n}\n```\n\nBoth are `noexcept` because they only copy pointers. That matters for performance: `std::vector<Buffer>` will move (not copy) elements on reallocation only if the move constructor is noexcept. Nulling the source prevents a double `delete[]` when both destructors run.",
+   "explanation": "Show stealing, nulling the source, freeing the old buffer, the self-assignment check and noexcept.",
+   "id": "L06-s2"
+  },
+  {
+   "q": "What are RVO and NRVO? Which one is guaranteed in C++17, and why should you not write `return std::move(local);`?",
+   "checks": [
+    {
+     "label": "RVO is for returning a prvalue / temporary",
+     "patterns": [
+      "RVO[\\s\\S]{0,120}(prvalue|temporary|unnamed)"
+     ]
+    },
+    {
+     "label": "NRVO is for a named local",
+     "patterns": [
+      "NRVO[\\s\\S]{0,120}named"
+     ]
+    },
+    {
+     "label": "RVO is guaranteed since C++17, NRVO isn't",
+     "patterns": [
+      "(guaranteed|mandatory)[\\s\\S]{0,60}(C\\+\\+\\s*17|17)",
+      "C\\+\\+\\s*17[\\s\\S]{0,80}(guaranteed|mandatory)"
+     ]
+    },
+    {
+     "label": "Object constructed directly in the caller's storage",
+     "patterns": [
+      "caller",
+      "return slot",
+      "in place"
+     ]
+    },
+    {
+     "label": "std::move blocks NRVO / pessimisation",
+     "patterns": [
+      "(block|prevent|disable|inhibit|defeat)s?[\\s\\S]{0,40}(NRVO|elision)",
+      "pessimi[sz]"
+     ]
+    }
+   ],
+   "modelAnswer": "**RVO** (return value optimisation) applies when you return a **prvalue/temporary**: `return File(fd, path);`. Since **C++17 it's guaranteed** (mandatory copy elision): the object is constructed directly in the **caller's** storage via the hidden return-slot pointer, with no copy or move constructor at all.\n\n**NRVO** applies to a **named** local: `File a; …; return a;`. It's permitted but **not guaranteed**; compilers do it when one object is returned on every path. If they can't, the returned local is **implicitly moved**, never copied.\n\n`return std::move(local);` turns the operand into an xvalue expression, which **blocks NRVO** and forces a move constructor call that would otherwise have been elided: a pessimisation (`-Wpessimizing-move`). Just write `return local;`.",
+   "explanation": "Distinguish prvalue (guaranteed) vs named (optional), say where the object is built, and say why std::move hurts.",
+   "id": "L06-s3"
+  },
+  {
+   "q": "Find and explain the bugs in this class from our custom vector exercise:\n    template <typename T> class vector {\n      size_t mSize{0}, mCapacity{0}; T* mData{nullptr};\n    public:\n      vector() : mCapacity(4), mData(new T[4]) {}\n      vector(const vector<int>& other) {\n        mData = new T[other.mSize];\n        for (size_t i = 0; i < mSize; i++) mData[i] = other.mData[i];\n        mSize = other.mSize; mCapacity = other.mSize;\n      }\n      void pop_back() { if (mSize == 0) throw; mData[mSize].~T(); mSize--; }\n    };",
+   "checks": [
+    {
+     "label": "Copy loop uses mSize before it's set (copies nothing)",
+     "patterns": [
+      "mSize[\\s\\S]{0,80}(0|zero|before|not (yet )?set)",
+      "copies nothing"
+     ]
+    },
+    {
+     "label": "Parameter should be vector<T> / vector, not vector<int>",
+     "patterns": [
+      "vector\\s*<\\s*T\\s*>",
+      "vector<int>[\\s\\S]{0,60}(wrong|should|only works)"
+     ]
+    },
+    {
+     "label": "Missing destructor: leak",
+     "patterns": [
+      "leak",
+      "no destructor",
+      "missing destructor"
+     ]
+    },
+    {
+     "label": "pop_back off by one",
+     "patterns": [
+      "off[- ]by[- ]one",
+      "one past",
+      "mData\\s*\\[\\s*mSize\\s*-\\s*1\\s*\\]",
+      "--\\s*mSize"
+     ]
+    },
+    {
+     "label": "Bare throw calls terminate",
+     "patterns": [
+      "terminate"
+     ]
+    }
+   ],
+   "modelAnswer": "1. The copy constructor takes `const vector<int>&`; inside `vector<T>` it should be `const vector& other` (`vector<T>`), otherwise it isn't a copy constructor for `vector<double>`.\n2. The loop runs `i < mSize` while `mSize` is still **0** (default member initialiser), so it **copies nothing**; the elements are left default-initialised. Loop to `other.mSize` or set `mSize` first.\n3. There's **no destructor**, so `mData` **leaks**; and once one is added, the implicit copy/move assignment would shallow-copy `mData` and double `delete[]`. Apply the Rule of 5.\n4. `pop_back` is **off by one**: `mData[mSize]` is one past the last element. It should be `--mSize; mData[mSize].~T();`. Even then, calling `~T()` on an element created by `new T[]` means `delete[]` destroys it again; a real vector uses raw storage plus placement new.\n5. A bare `throw;` with no active exception calls `std::terminate`; throw `std::out_of_range` or assert.\n6. Not shown, but the move constructor should be `noexcept`, and `push_back` must grow (2x) instead of returning.",
+   "explanation": "Spot the uninitialised-size loop, the wrong parameter type, the leak, the off-by-one and the bare throw.",
+   "id": "L06-s4"
+  },
+  {
+   "q": "Explain SSO in std::string: give sizes for libstdc++ and libc++, and say why it matters for low-latency code.",
+   "checks": [
+    {
+     "label": "Short strings stored inline in the object, no heap",
+     "patterns": [
+      "inline",
+      "inside the (string )?object",
+      "no heap",
+      "without (a )?heap"
+     ]
+    },
+    {
+     "label": "libstdc++: 32 bytes / 15 chars",
+     "patterns": [
+      "32[\\s\\S]{0,90}15",
+      "15[\\s\\S]{0,90}32"
+     ]
+    },
+    {
+     "label": "libc++: 24 bytes / 22 chars",
+     "patterns": [
+      "24[\\s\\S]{0,90}22",
+      "22[\\s\\S]{0,90}24"
+     ]
+    },
+    {
+     "label": "Avoids allocation / latency spike when it grows",
+     "patterns": [
+      "alloc"
+     ]
+    },
+    {
+     "label": "Moving a short string still copies the bytes",
+     "patterns": [
+      "mov[\\s\\S]{0,80}(copy|copies|not cheaper)"
+     ]
+    }
+   ],
+   "modelAnswer": "SSO (small string optimisation) keeps short strings **inline**, inside the string object itself, so no heap allocation happens. libstdc++ (GCC): `sizeof(std::string)` = **32** bytes with a 16-byte buffer, so up to **15** chars plus `'\\0'`. libc++ (Clang): **24** bytes, up to **22** chars.\n\nWhy it matters: most symbols, venue codes and short IDs fit, so creating and copying them doesn't call `malloc` (which costs tens of ns to microseconds and can contend), and the data sits on the same cache line as the object. But a string that grows past the inline capacity suddenly **allocates**, a latency spike on the hot path. Also, **moving** a short string isn't cheaper than copying: there's no heap pointer to steal, so the inline bytes are copied. HFT code often uses fixed `char[8]` or integer-packed symbols to make comparisons a single instruction.",
+   "explanation": "They want the inline-buffer idea, the correct sizes, the allocation/latency point and the move-isn't-free caveat.",
+   "id": "L06-s5"
+  },
+  {
+   "q": "Implement `is_destructible` (for object types) and `is_same` using template specialisation, and explain the technique.",
+   "checks": [
+    {
+     "label": "is_same primary false",
+     "patterns": [
+      "struct\\s+is_same\\s*:\\s*std::false_type",
+      "is_same[\\s\\S]{0,60}false"
+     ]
+    },
+    {
+     "label": "is_same partial specialisation <T, T> true",
+     "patterns": [
+      "is_same\\s*<\\s*(\\w+)\\s*,\\s*\\1\\s*>"
+     ]
+    },
+    {
+     "label": "void_t / declval detection",
+     "patterns": [
+      "void_t",
+      "declval"
+     ]
+    },
+    {
+     "label": "Destructor expression ~T()",
+     "patterns": [
+      "~\\s*T\\s*\\(\\s*\\)"
+     ]
+    },
+    {
+     "label": "Explains SFINAE / specialisation selection",
+     "patterns": [
+      "SFINAE",
+      "substitution",
+      "more specialized",
+      "specialisation is (chosen|selected)",
+      "specialization is (chosen|selected)"
+     ]
+    }
+   ],
+   "modelAnswer": "```cpp\ntemplate <class A, class B> struct is_same       : std::false_type {};\ntemplate <class A>          struct is_same<A, A> : std::true_type  {};   // partial specialisation\n\ntemplate <class T, class = void>\nstruct is_destructible : std::false_type {};\ntemplate <class T>\nstruct is_destructible<T, std::void_t<decltype(std::declval<T&>().~T())>> : std::true_type {};\n```\n\nTechnique: the primary template gives the default answer (`false`). A partial specialisation matches only when its pattern fits: `<A, A>` when both arguments are the same type. For `is_destructible`, `std::declval<T&>()` pretends to have a `T` in an unevaluated `decltype`, and `.~T()` checks whether the destructor is callable. If it is, `void_t<...>` is `void` and the specialisation matches the default `void` argument; if not, **SFINAE** (substitution failure) silently discards the specialisation and the primary `false` is used. `is_move_constructible<T>` is built the same way, as `is_constructible<T, T&&>`.",
+   "explanation": "Primary/specialisation pattern, void_t + declval detection, and SFINAE as the selection mechanism.",
+   "id": "L06-s6"
+  },
+  {
+   "q": "Predict what this prints (C++17, GCC) and explain each line:\n    struct S { S() { std::cout << \"ctor \"; } S(const S&) { std::cout << \"copy \"; }\n               S(S&&) noexcept { std::cout << \"move \"; } };\n    S a() { return S(); }\n    S b() { S s; return s; }\n    S c(bool f) { S x, y; if (f) return x; return y; }\n    int main() { S s1 = a(); S s2 = b(); S s3 = c(true); }",
+   "checks": [
+    {
+     "label": "a(): only ctor (guaranteed elision)",
+     "patterns": [
+      "a\\(\\)[\\s\\S]{0,80}(only )?ctor",
+      "a\\(\\)[\\s\\S]{0,120}(guaranteed|mandatory|RVO)"
+     ]
+    },
+    {
+     "label": "b(): ctor only thanks to NRVO",
+     "patterns": [
+      "b\\(\\)[\\s\\S]{0,120}NRVO"
+     ]
+    },
+    {
+     "label": "c(): ctor ctor move",
+     "patterns": [
+      "ctor ctor move"
+     ]
+    },
+    {
+     "label": "No copies anywhere",
+     "patterns": [
+      "no cop(y|ies)",
+      "never cop",
+      "copy[\\s\\S]{0,40}never"
+     ]
+    }
+   ],
+   "modelAnswer": "Output: `ctor ctor ctor ctor move` (typically).\n\n- `a()` returns a prvalue: guaranteed elision (RVO), so `ctor` is printed only once and s1 is built in place.\n- `b()` returns a single named local: GCC applies NRVO, so `ctor` only.\n- `c(true)` has two named locals (`x`, `y`) that could be returned, so NRVO can't pick one storage location: `ctor ctor` for x and y, then the returned local is **implicitly moved**: `move`.\n- There are no copies anywhere: a returned local is treated as an rvalue first, and the move constructor exists (and is noexcept).",
+   "explanation": "Shows understanding of RVO vs NRVO vs implicit move.",
+   "id": "L06-s7"
+  }
+ ],
+ "quiz": [],
+ "coding": [
+  {
+   "id": "inplace-vector",
+   "title": "Fixed-Capacity In-Place Vector"
+  },
+  {
+   "id": "shared-ptr",
+   "title": "SharedPtr with an Atomic Control Block"
+  },
+  {
+   "id": "sso-string",
+   "title": "String with Small-String Optimisation"
+  }
+ ],
+ "prev": {
+  "num": 5,
+  "file": "lecture-05.html"
+ },
+ "next": {
+  "num": 7,
+  "file": "lecture-07.html"
+ }
+};

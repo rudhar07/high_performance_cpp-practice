@@ -1,0 +1,930 @@
+window.PAGE = {
+ "num": 3,
+ "title": "Pointers and References 2: Stack, Heap and Allocators",
+ "summary": "Where memory comes from: the process layout, stack frames vs heap allocation, what new and delete really do (malloc, brk/mmap, page faults), illustrated by the class stack_memory, heap_memory, Vector and stack-only Order/Trader exercises. It then covers how low-latency systems manage memory: no allocation on the hot path, pre-allocated pools, fragmentation and its prevention, and custom allocators, arenas and std::pmr.",
+ "notes": [
+  {
+   "heading": "Process memory layout",
+   "body": "A Linux x86-64 process sees a private virtual address space, from low to high addresses:\n\n| Region | Holds | Lifetime |\n|---|---|---|\n| `.text` | machine code (read-only, executable) | whole program |\n| `.rodata` | string literals, `const` tables | whole program |\n| `.data` / `.bss` | initialised / zero-initialised globals and statics | whole program |\n| heap (grows **up**, via `brk`) | small `malloc`/`new` blocks | until freed |\n| mmap region | large allocations, shared libraries, mapped files, thread stacks | until `munmap` |\n| stack (grows **down**) | locals, return addresses, saved registers, spilled arguments | until the function returns |\n\n- The main thread's stack is limited by `ulimit -s`, **8 MiB by default** on most Linux distributions, and glibc also gives new threads 8 MiB stacks by default. Exceeding it means a guard-page hit and a **segfault** (\"stack overflow\").\n- Memory is handed out in **4 KiB pages**. Virtual pages are *reserved* cheaply, and a physical frame is attached only on **first touch** (a page fault). `RSS` (resident set size) counts touched pages only."
+  },
+  {
+   "heading": "The stack",
+   "body": "```cpp\nvoid f() {\n    int a = 1;            // lives in f's stack frame (or just in a register)\n    Order o{1, 100, 5};   // whole object on the stack: no allocator call at all\n    char buf[256];\n}                         // all freed at once by restoring rsp; destructors run in reverse order\n```\n\n```asm\nf:  sub  rsp, 280        ; \"allocation\" = one subtraction\n    ...\n    add  rsp, 280        ; \"free\" = one addition\n    ret\n```\n\n- **Cost of allocation: essentially zero.** The frame size is known at compile time, so it is a single `sub rsp`. There is no allocator, no lock and no syscall.\n- **Hot in cache.** The top of the stack was just used, so it is almost always in L1. That gives excellent locality.\n- **LIFO and automatic.** Lifetime is tied to scope, and the destructors run deterministically (RAII). **In class (`Lec-7/person_stack.cpp`):** `Person person{1,12,0};` inside a function prints \"1 Person delete\" when the function returns, with no `delete` needed.\n- **Limits:** the size must be known at compile time (VLAs aside), objects cannot outlive the function, and the total is limited (8 MiB). Large buffers or recursion depth can overflow it.\n\n**In class (`Lec-6/stack_memory.cpp`):**\n\n```cpp\nvoid func() { int arr[1024*1024]; }        // 4 MiB on the stack, called once per second forever\n```\n\n`4 MiB < 8 MiB`, so it does not overflow. Each call just moves `rsp` down and back. It makes no syscalls, and because `arr` is never touched, the pages are not even faulted in, so RSS stays flat. At `-O2` the unused array is removed entirely. Change it to `int arr[3*1024*1024]` (12 MiB) and *touch* it, and you get a segfault."
+  },
+  {
+   "heading": "The heap: new, delete and what happens underneath",
+   "body": "```cpp\nOrder* o = new Order{1, 100, 5};   // 1. operator new(sizeof(Order)): get raw memory\n                                   // 2. run the constructor in that memory\ndelete o;                          // 1. run the destructor   2. operator delete(o)\n\nint* a = new int[n];               // array form: allocate n ints (uninitialised for int!)\nint* z = new int[n]();             // value-initialised: all zeros\ndelete[] a;                        // MUST pair with new[]\n\nOrder* p = new (std::nothrow) Order; // returns nullptr instead of throwing std::bad_alloc\nalignas(Order) unsigned char buf[sizeof(Order)];\nOrder* q = new (buf) Order{2, 99, 1}; // placement new: construct in existing memory, no allocation\nq->~Order();                          // placement new needs an explicit destructor call\n```\n\n| Allocate | Release | Mixing is UB |\n|---|---|---|\n| `malloc` / `calloc` | `free` | no constructors or destructors |\n| `new T` | `delete p` | |\n| `new T[n]` | `delete[] p` | `delete[]` knows how many destructors to run |\n\n**What `new` costs.** `operator new` calls `malloc` (glibc ptmalloc2):\n\n- **Fast path:** a per-thread cache (`tcache`) or free bin gives about 20–50 ns, with no syscall.\n- **Slow path:** when the arena runs out, `brk`/`sbrk` grows the heap, and requests ≥ `M_MMAP_THRESHOLD` (128 KiB by default, adjusted dynamically) get their own `mmap`. A syscall costs about 1 µs or more, and **page faults on first touch** cost roughly 0.1–1 µs per 4 KiB page.\n- Freeing an mmapped block calls `munmap`, which can trigger TLB shootdowns (inter-processor interrupts) on other cores.\n- Multi-threaded allocation contends on arena locks, and the time taken varies a lot (a **fat tail**).\n\n**In class (`Lec-6/heap_memory.cpp`):** `new int[1024*2024]` (about 7.9 MiB) every second. Run it under `strace -e trace=memory ./a.out` and you see an `mmap` for the block and `munmap` on free, because it is far above the mmap threshold. (glibc may raise the threshold after the first free and switch to `brk`.) Two lessons: big heap allocations are syscalls, and `delete arr` should be `delete[] arr`. Note that since C++14 the compiler may elide a matching new/delete pair whose memory is unused, and Clang does that at `-O2`."
+  },
+  {
+   "heading": "Stack vs heap: comparison",
+   "body": "| | Stack | Heap |\n|---|---|---|\n| Allocation cost | `sub rsp` (~0) | `malloc` ~20–100 ns fast path; µs with syscalls and page faults |\n| Deallocation | automatic at scope exit | manual `delete` or RAII owner |\n| Size | fixed at compile time; ~8 MiB total | run-time size; limited by RAM and address space |\n| Lifetime | the enclosing scope | until freed: can outlive the function |\n| Locality | very hot, contiguous | may be scattered, so each object costs a pointer chase |\n| Thread safety | each thread has its own | shared allocator (locks or per-thread caches) |\n| Fragmentation | none | yes |\n| Failure mode | stack overflow (segfault) | `std::bad_alloc`, leaks, use-after-free |\n\n**Rule for low-latency code:** prefer the stack and pre-allocated storage. Use the heap only at start-up or for things that must outlive a scope, and never on the hot path."
+  },
+  {
+   "heading": "In class: the stack-only Order/Trader exercise",
+   "body": "**In class (`Lec-6/programming_exercise.cpp`):** write `struct Order { id, price, qty, buy/sell }` and `struct Trader { id, name }`. Five traders in a loop each send 100 orders per second. Version 1 must **promise to use no heap memory**, verified with **`strace`**. Version 2 is the heap version, for comparison.\n\n```cpp\n#include <array>\n#include <cstdint>\n#include <thread>\nenum class Side : uint8_t { Buy, Sell };\nstruct Order  { uint64_t id; int64_t price; uint32_t qty; Side side; };  // 24 bytes\nstruct Trader { uint32_t id; char name[16]; };      // fixed char array, not std::string\n\nint main() {\n    std::array<Trader, 5> traders{{{1,\"A\"},{2,\"B\"},{3,\"C\"},{4,\"D\"},{5,\"E\"}}};\n    std::array<Order, 100> batch;                    // reused every second, on the stack\n    uint64_t next_id = 0;\n    while (true) {\n        for (auto& t : traders)\n            for (auto& o : batch)\n                o = Order{++next_id, 10'000 + int64_t(next_id % 50), 10,\n                          (next_id & 1) ? Side::Buy : Side::Sell};\n        std::this_thread::sleep_for(std::chrono::seconds(1));\n    }\n}\n```\n\n```bash\ng++ -O2 stack_orders.cpp -o s && strace -f -e trace=brk,mmap,munmap ./s\n# after start-up (loader + libc setup) there should be NO brk/mmap calls inside the loop\n```\n\nThe heap version (`std::vector<Order>` created inside the loop, `new Trader`, a `std::string` name) shows allocator activity, and `ltrace`/`perf` show `malloc`/`free` on every iteration. Even when `malloc` makes no syscall, it costs time and adds jitter.\n\nWatch out for hidden allocations: `std::string` beyond SSO (more than 15 characters in libstdc++), `std::function` with big captures, `std::vector` growth, `std::map` and `std::unordered_map` nodes, exceptions, and iostream buffers (allocated once)."
+  },
+  {
+   "heading": "In class: a hand-written Vector (and what's wrong with it)",
+   "body": "**In class (`Lec-6/vector.cpp`):**\n\n```cpp\nclass Vector {\n    uint32_t size;  int64_t* arr;  uint32_t index;\npublic:\n    Vector(uint32_t sz) : size(sz), arr(new int64_t[sz]), index(0) {}\n    void push_back(int64_t v) { arr[index++] = v; }   // no capacity check!\n    void print() const;\n};\nint main() { uint32_t N; std::cin >> N; Vector obj{N};\n             for (int i = 0; i < 2000; i++) { obj.push_back(12); obj.push_back(13); obj.push_back(15); } }\n```\n\nIt shows the core idea (a heap buffer plus a count, and pre-sizing from input), but as written:\n\n1. **Heap buffer overflow.** 6000 elements are pushed. If `N < 6000`, the writes go past the end of the allocation: UB that corrupts the allocator's metadata.\n2. **Leak.** There is no destructor, so `arr` is never `delete[]`d.\n3. **Rule of three.** Once you add a destructor, the implicit copy constructor copies the *pointer*, so two `Vector`s would `delete[]` the same buffer (a double free). You need a copy constructor and copy assignment (and move operations, Rule of 5).\n\nA minimal correct growing version:\n\n```cpp\nclass Vector {\n    int64_t* data_ = nullptr; size_t size_ = 0, cap_ = 0;\npublic:\n    explicit Vector(size_t cap) : data_(new int64_t[cap]), cap_(cap) {}\n    ~Vector() { delete[] data_; }\n    Vector(const Vector&) = delete;            // or implement a deep copy\n    Vector& operator=(const Vector&) = delete;\n    void push_back(int64_t v) {\n        if (size_ == cap_) grow();             // amortised O(1)\n        data_[size_++] = v;\n    }\nprivate:\n    void grow() {\n        size_t nc = cap_ ? cap_ * 2 : 8;       // geometric growth\n        int64_t* nd = new int64_t[nc];\n        std::copy(data_, data_ + size_, nd);\n        delete[] data_; data_ = nd; cap_ = nc;\n    }\n};\n```\n\n**The low-latency takeaway:** the class version's real idea, *size the buffer once up front from known input*, is exactly `std::vector::reserve`. Growth is a latency spike (allocate, copy n elements, free), so do it at start-up and never in the hot loop."
+  },
+  {
+   "heading": "Memory management in a quant / low-latency context",
+   "body": "The hot path (market data in, then decision, then order out) has a budget of a few microseconds or less. A single `malloc` slow path or page fault can blow it. The principles:\n\n1. **No allocation on the hot path.** Allocate everything at start-up: order pools, ring buffers, book levels, and `reserve()`d vectors.\n2. **Pre-fault and lock memory.** Touch every page at start-up (`memset`, or `MAP_POPULATE` with `mmap`) so no first-touch page faults happen during trading. Call `mlockall(MCL_CURRENT | MCL_FUTURE)` so pages are never swapped out.\n3. **Huge pages** (2 MiB instead of 4 KiB) mean fewer TLB misses for big pools and books.\n4. **Contiguous, cache-friendly layouts.** Use arrays of structs indexed by an id instead of pointer-linked nodes. A cache-line miss to DRAM is about 60–100 ns, the same as hundreds of instructions.\n5. **Avoid hidden allocations.** Watch `std::string` concatenation, `std::map` inserts, `std::function`, `shared_ptr` creation (control block), exceptions and logging.\n6. **Deterministic deallocation.** Return objects to a pool instead of `free`, and never trigger `munmap` (TLB shootdowns) during trading.\n7. **Measure.** Use `strace -c`, `perf stat -e page-faults`, `ltrace -e malloc`, and allocation counters (overriding `operator new` in tests).\n\nWhy not just use `malloc`? Its *average* is fine. Its **tail** is the problem: occasional lock contention, heap growth via `brk`/`mmap`, page faults, and consolidation of free chunks. Trading systems are judged on p99 and p99.9."
+  },
+  {
+   "heading": "Frequent allocations vs pre-allocated pools",
+   "body": "An **object pool** (fixed-size free list) pre-allocates N slots of one type and hands them out in O(1) with no syscall:\n\n```cpp\ntemplate <typename T, size_t N>\nclass Pool {\n    union Slot { Slot* next; alignas(T) unsigned char storage[sizeof(T)]; };\n    std::array<Slot, N> slots_;      // one contiguous block (could be a static or a huge page)\n    Slot* free_ = nullptr;\npublic:\n    Pool() {                          // thread all slots onto the free list once\n        for (size_t i = 0; i < N; ++i) { slots_[i].next = free_; free_ = &slots_[i]; }\n    }\n    template <class... Args> T* create(Args&&... a) {\n        if (!free_) return nullptr;   // pool exhausted: a design-time sizing decision\n        Slot* s = free_; free_ = s->next;               // pop: O(1), two instructions\n        return new (s->storage) T(std::forward<Args>(a)...);  // placement new\n    }\n    void destroy(T* p) {\n        p->~T();\n        Slot* s = reinterpret_cast<Slot*>(p);\n        s->next = free_; free_ = s;                     // push: O(1)\n    }\n};\nPool<Order, 1'000'000> orders;   // sized for the worst day, allocated once\n```\n\n| | `new`/`delete` per order | Pre-allocated pool |\n|---|---|---|\n| Alloc cost | ~20–100 ns, occasionally µs | a few ns (pop from the free list) |\n| Syscalls or page faults during trading | possible | none (pre-faulted) |\n| Thread safety | general-purpose locks or tcache | single-threaded by design (or one pool per thread) |\n| Fragmentation | yes, over time | none: all slots are the same size |\n| Locality | objects scattered | objects packed in one block |\n| Flexibility | any size, unbounded | one size, fixed capacity |\n\nThe trade-off is that capacity must be chosen up front, and objects of different sizes need different pools (or size classes)."
+  },
+  {
+   "heading": "Memory fragmentation and how to prevent it",
+   "body": "- **External fragmentation:** free memory exists but is split into holes too small for the request. For example, freeing every other 64 B block leaves plenty of free bytes but no contiguous 128 B block. The allocator must then grow the heap (syscall) even though \"enough\" memory is free.\n- **Internal fragmentation:** waste *inside* an allocated block, from rounding up to a size class or alignment, plus malloc headers. A 17-byte request may consume 32 bytes.\n- **Causes:** many allocations of mixed sizes with mixed lifetimes interleaved over a long run (long-lived book orders next to short-lived messages).\n- **Consequences:** a growing RSS, worse cache and TLB locality (related objects are spread out), and slower `malloc`, which must search or consolidate.\n\n**Prevention:**\n\n1. **Pre-allocate up front** and reuse (pools, ring buffers, `reserve`).\n2. **Fixed-size pools per type.** Every slot is the same size, so a freed slot always fits the next request. There is zero external fragmentation.\n3. **Arena (bump or monotonic) allocators** for things with the same lifetime: allocate by bumping a pointer, and free everything at once (for example, per message or per trading day).\n4. **Size-class allocators** such as `tcmalloc`/`jemalloc` (per-thread caches, segregated size classes) reduce fragmentation and contention compared with general glibc malloc.\n5. **Separate long-lived and short-lived allocations** into different arenas.\n6. Prefer **contiguous containers** (`vector`, flat arrays) over node-based ones (`list`, `map`) that make one small allocation per element."
+  },
+  {
+   "heading": "Allocators: std::allocator, custom allocators and std::pmr",
+   "body": "Every standard container takes an allocator parameter, `std::vector<T, Alloc>`. The default `std::allocator<T>` simply calls `operator new`/`operator delete`. A **minimal custom allocator** (C++11 and later; `std::allocator_traits` fills in the rest):\n\n```cpp\ntemplate <class T>\nstruct ArenaAlloc {\n    using value_type = T;\n    Arena* arena;                                        // non-owning\n    explicit ArenaAlloc(Arena* a) noexcept : arena(a) {}\n    template <class U> ArenaAlloc(const ArenaAlloc<U>& o) noexcept : arena(o.arena) {}  // rebind\n    T* allocate(std::size_t n) { return static_cast<T*>(arena->alloc(n * sizeof(T), alignof(T))); }\n    void deallocate(T*, std::size_t) noexcept {}         // the arena frees everything at once\n};\ntemplate <class T, class U>\nbool operator==(const ArenaAlloc<T>& a, const ArenaAlloc<U>& b) { return a.arena == b.arena; }\ntemplate <class T, class U>\nbool operator!=(const ArenaAlloc<T>& a, const ArenaAlloc<U>& b) { return !(a == b); }\n\nstd::vector<Order, ArenaAlloc<Order>> v{ArenaAlloc<Order>(&arena)};\n```\n\nA **bump (arena) allocator** behind it:\n\n```cpp\nclass Arena {\n    std::byte* buf_; size_t cap_, off_ = 0;\npublic:\n    Arena(std::byte* b, size_t c) : buf_(b), cap_(c) {}\n    void* alloc(size_t n, size_t align) {\n        size_t p = (off_ + align - 1) & ~(align - 1);   // round up (align is a power of two)\n        if (p + n > cap_) throw std::bad_alloc{};\n        off_ = p + n; return buf_ + p;                  // O(1): add and compare\n    }\n    void reset() { off_ = 0; }                          // free EVERYTHING in O(1)\n};\n```\n\n**C++17 polymorphic memory resources (`<memory_resource>`)** give you this without writing an allocator class:\n\n```cpp\n#include <memory_resource>\nstd::array<std::byte, 64 * 1024> buffer;                        // on the stack\nstd::pmr::monotonic_buffer_resource arena{buffer.data(), buffer.size()};\nstd::pmr::vector<Order> orders{&arena};                          // allocates from the buffer\norders.reserve(1000);                                            // no malloc as long as it fits\n// other resources: unsynchronized_pool_resource (single-threaded pools by size class),\n// synchronized_pool_resource, new_delete_resource(), null_memory_resource() (throws: catches leaks to the heap)\n```\n\n- `pmr` containers carry a `memory_resource*` (8 B) and call it through a **virtual** `do_allocate`. That is a small indirection cost, but one container type works with any resource.\n- A monotonic resource never frees individual blocks (`deallocate` is a no-op). Memory is returned when the resource is destroyed or `release()`d, so it is perfect for per-message or per-batch scratch space.\n- Replacing the global allocator (linking `tcmalloc` or `jemalloc`, or `LD_PRELOAD`) speeds up every `new` with no code change, but it is still not free. The hot path should not allocate at all."
+  },
+  {
+   "heading": "Quick revision",
+   "body": "- Layout: text, data/bss, heap (grows up), mmap region, stack (grows down).\n- The default stack limit is 8 MiB (`ulimit -s`). Overflow is a segfault.\n- Stack allocation is one `sub rsp`: free, hot in cache, LIFO, automatic destructors.\n- Heap: `new` = `operator new` (malloc) + constructor, and `delete` = destructor + `operator delete`.\n- Pairs: `new`/`delete`, `new[]`/`delete[]`, `malloc`/`free`. Mixing them is UB.\n- malloc fast path ~20–100 ns. The slow path is `brk`/`mmap` syscalls plus page faults (µs).\n- Allocations ≥ ~128 KiB go to `mmap` (glibc `M_MMAP_THRESHOLD`, adjusted dynamically).\n- Pages are 4 KiB. Physical memory is attached on first touch (page fault). RSS counts touched pages.\n- In class, a 4 MiB stack array called every second has no syscalls and no RSS growth if untouched.\n- In class, an ~8 MiB `new[]` every second shows `mmap`/`munmap` in `strace`.\n- Low-latency rule: no allocation on the hot path. Pre-allocate, pre-fault, `mlock`, use huge pages.\n- A pool (free list) gives O(1) alloc and free, no syscalls and no fragmentation, at a fixed capacity.\n- External fragmentation: free memory in holes too small to use. Internal: rounding waste inside a block.\n- Prevent fragmentation with fixed-size pools, arenas, size classes, separated lifetimes and contiguous containers.\n- An arena (bump) allocator allocates by adding to an offset and frees everything at once with `reset`.\n- `std::pmr::monotonic_buffer_resource` with `std::pmr::vector` gives arena allocation from a stack buffer.\n- A custom allocator needs `value_type`, `allocate`, `deallocate`, a converting constructor and `==`.\n- Placement new constructs in existing memory, and you then call the destructor explicitly."
+  },
+  {
+   "heading": "Exam traps",
+   "body": "- **\"The stack is faster because it is a different kind of RAM.\"** False: it is the same RAM. The stack is fast because allocation is one instruction and the memory is hot in cache.\n- **`new int[n]` zero-initialises.** False: ints are left indeterminate. `new int[n]()` or `{}` zeroes them.\n- **`delete` on a `new[]` pointer**, or `free` on a `new` pointer, is UB.\n- **\"`malloc` always makes a syscall.\"** False: most calls are served from user-space caches. Only heap growth and large blocks hit `brk`/`mmap`.\n- **\"Allocating memory uses RAM.\"** Only touched pages become resident. Untouched virtual memory costs nothing, which is why the in-class 4 MiB stack array didn't raise RSS.\n- **Returning a pointer to a stack array** dangles once the function returns.\n- **A large local array** (`int big[4'000'000];`, 16 MB) overflows the 8 MiB stack. Make it `static`, global or heap-allocated.\n- **Thread stacks** default to 8 MiB too (glibc), but they can be set smaller. Deep recursion in a worker thread overflows sooner.\n- **Placement new** does not allocate, so never `delete` its result. Call `p->~T()` explicitly.\n- **A pool is not thread-safe** unless designed to be. Use one pool per thread or a lock-free free list (which raises ABA, session 10).\n- **Monotonic resources never reuse freed memory**, so a long-running loop that keeps allocating from one will exhaust it. Reset it per batch.\n- **`reserve` vs `resize`**: `reserve` changes capacity only. Indexing past `size()` is still UB.\n- **tcmalloc or jemalloc** makes allocation cheaper but not free, and does not excuse allocating on the hot path."
+  }
+ ],
+ "keyTerms": [
+  {
+   "term": "Stack",
+   "def": "Per-thread LIFO memory region for locals and call frames. Allocation is a stack-pointer adjustment, and the default limit is 8 MiB on Linux."
+  },
+  {
+   "term": "Heap",
+   "def": "Memory obtained at run time from the allocator (malloc or new), with a lifetime controlled by the program."
+  },
+  {
+   "term": "Stack frame",
+   "def": "The block of stack used by one function call: locals, saved registers and the return address."
+  },
+  {
+   "term": "operator new",
+   "def": "The allocation function used by a new-expression. By default it calls malloc and throws std::bad_alloc on failure."
+  },
+  {
+   "term": "Placement new",
+   "def": "`new (addr) T(args)`: constructs an object in already-allocated memory without allocating."
+  },
+  {
+   "term": "brk / sbrk",
+   "def": "Syscalls that move the end of the heap segment. glibc uses them to grow the main arena."
+  },
+  {
+   "term": "mmap",
+   "def": "Syscall that maps pages into the address space. glibc uses it for large allocations (at least ~128 KiB)."
+  },
+  {
+   "term": "Page fault",
+   "def": "A trap taken on the first access to a virtual page with no physical frame yet. It costs on the order of a microsecond."
+  },
+  {
+   "term": "RSS",
+   "def": "Resident Set Size: the physical memory a process currently uses (touched pages only)."
+  },
+  {
+   "term": "mlock / mlockall",
+   "def": "Pins pages in RAM so they are never swapped out, avoiding major page faults on the hot path."
+  },
+  {
+   "term": "Hot path",
+   "def": "The latency-critical code path (market data to decision to order) where no allocations, syscalls or locks are allowed."
+  },
+  {
+   "term": "Object pool",
+   "def": "Pre-allocated set of fixed-size slots managed by a free list. O(1) alloc and free with no fragmentation."
+  },
+  {
+   "term": "Free list",
+   "def": "A linked list threaded through the unused slots of a pool. Alloc pops and free pushes."
+  },
+  {
+   "term": "Arena / bump allocator",
+   "def": "Allocates by advancing an offset into a big buffer and frees everything at once by resetting the offset."
+  },
+  {
+   "term": "External fragmentation",
+   "def": "Free memory split into holes too small to satisfy requests, although the total free space is enough."
+  },
+  {
+   "term": "Internal fragmentation",
+   "def": "Wasted space inside allocated blocks, due to size-class rounding, alignment and headers."
+  },
+  {
+   "term": "std::allocator_traits",
+   "def": "Adapter that supplies default typedefs and operations for allocators, so a custom allocator can be minimal."
+  },
+  {
+   "term": "std::pmr::monotonic_buffer_resource",
+   "def": "C++17 memory resource that bump-allocates from a buffer and releases only when destroyed or release()d."
+  },
+  {
+   "term": "tcmalloc / jemalloc",
+   "def": "Drop-in malloc replacements with per-thread caches and size classes: faster, with less contention and fragmentation."
+  }
+ ],
+ "mcqs": [
+  {
+   "q": "Why is allocating a local array on the stack essentially free?",
+   "options": [
+    "Stack memory is a faster kind of RAM",
+    "The frame size is known at compile time, so allocation is one adjustment of the stack pointer (sub rsp)",
+    "The OS pre-zeroes stack memory",
+    "The compiler stores locals in registers only"
+   ],
+   "answer": 1,
+   "explanation": "Stack allocation means moving rsp, with no allocator call, lock or syscall, and the top of the stack is hot in L1.",
+   "distractors": "It is the same DRAM as the heap. Large locals must live in memory, not registers.",
+   "source": "lecture",
+   "id": "L03-m1"
+  },
+  {
+   "q": "What is the default main-thread stack size limit on a typical Linux system?",
+   "options": [
+    "64 KiB",
+    "1 MiB",
+    "8 MiB",
+    "Unlimited"
+   ],
+   "answer": 2,
+   "explanation": "`ulimit -s` defaults to 8192 KiB on most distributions, and glibc also gives new threads 8 MiB stacks by default.",
+   "distractors": "1 MiB is the Windows default. Unlimited is possible to configure but is not the default.",
+   "source": "lecture",
+   "id": "L03-m2"
+  },
+  {
+   "q": "In class, this ran once per second forever. What do you observe at -O0 on Linux?\n\n    void func() { int arr[1024*1024]; }",
+   "options": [
+    "It segfaults immediately: 4 MiB exceeds the stack",
+    "RSS grows by 4 MiB every second",
+    "strace shows an mmap call every second",
+    "It runs fine: 4 MiB < 8 MiB, there are no syscalls, and RSS stays flat because the pages are never touched"
+   ],
+   "answer": 3,
+   "explanation": "The frame just moves rsp. The array is never written, so its pages are never faulted in. Each call reuses the same stack region.",
+   "distractors": "Stack allocation is not a syscall, and untouched virtual pages don't count in RSS.",
+   "source": "lecture",
+   "id": "L03-m3"
+  },
+  {
+   "q": "Which of these overflows the default stack (8 MiB) when the function runs and writes to every element?",
+   "options": [
+    "void f(){ int a[1'000'000]; }   (4 MB)",
+    "void f(){ static int a[4'000'000]; }",
+    "void f(){ std::vector<int> a(4'000'000); }",
+    "void f(){ double a[2'000'000]; }   (16 MB)"
+   ],
+   "answer": 3,
+   "explanation": "2,000,000 doubles × 8 B = 16 MB of locals, more than 8 MiB, so touching it hits the guard page and segfaults.",
+   "distractors": "4 MB fits, a static array lives in .bss, and a vector's buffer is on the heap.",
+   "source": "lecture",
+   "id": "L03-m4"
+  },
+  {
+   "q": "What does `new Order{1, 100, 5}` do, in order?",
+   "options": [
+    "Calls the constructor, then malloc",
+    "Calls operator new to get raw memory, then runs the constructor in it",
+    "Allocates on the stack and copies to the heap",
+    "Only calls malloc; constructors run lazily"
+   ],
+   "answer": 1,
+   "explanation": "A new-expression first allocates via operator new (usually malloc), then constructs. delete reverses this: destructor first, then operator delete.",
+   "distractors": "You can't construct before allocating, and there is no stack copy or lazy construction.",
+   "source": "lecture",
+   "id": "L03-m5"
+  },
+  {
+   "q": "What is the value of `a[0]` after `int* a = new int[4];`?",
+   "options": [
+    "Indeterminate: reading it is UB",
+    "0",
+    "Garbage, but well-defined to read",
+    "-1"
+   ],
+   "answer": 0,
+   "explanation": "new int[n] default-initialises, which for int means no initialisation. Use new int[4]() or new int[4]{} for zeros.",
+   "distractors": "Only value-initialisation, statics or calloc give zeros. Reading an indeterminate int is UB, not merely 'garbage'.",
+   "source": "lecture",
+   "id": "L03-m6"
+  },
+  {
+   "q": "Which deallocation is correct for `T* p = new T[10];`?",
+   "options": [
+    "delete p;",
+    "free(p);",
+    "delete[] p;",
+    "p->~T();"
+   ],
+   "answer": 2,
+   "explanation": "Array new must be paired with delete[], which runs 10 destructors and frees the block correctly.",
+   "distractors": "delete or free on it is UB, and calling one destructor frees nothing.",
+   "source": "lecture",
+   "id": "L03-m7"
+  },
+  {
+   "q": "In class, `new int[1024*2024]` (~7.9 MiB) was allocated and freed every second. What does `strace` typically show for glibc?",
+   "options": [
+    "Nothing: malloc never calls the kernel",
+    "An mmap for the block and a munmap when it is freed, because it is above the mmap threshold",
+    "A brk call per element",
+    "An execve per allocation"
+   ],
+   "answer": 1,
+   "explanation": "glibc serves requests above M_MMAP_THRESHOLD (128 KiB by default, adjusted dynamically) with a dedicated mmap and returns them with munmap.",
+   "distractors": "Small requests avoid syscalls, but this one is huge. brk moves the heap end once per growth, not per element.",
+   "source": "lecture",
+   "id": "L03-m8"
+  },
+  {
+   "q": "Which is the BEST description of the cost profile of glibc malloc in a trading system?",
+   "options": [
+    "Constant 1 ns",
+    "Always a syscall, ~10 µs",
+    "Usually tens of nanoseconds, but with a fat tail: occasional syscalls, page faults and lock contention cost microseconds",
+    "Free, because the OS caches it"
+   ],
+   "answer": 2,
+   "explanation": "The fast path uses tcache or bins. The slow path grows the heap, faults pages in or contends on arenas. HFT cares about the tail.",
+   "distractors": "Most calls don't enter the kernel, but none are free.",
+   "source": "lecture",
+   "id": "L03-m9"
+  },
+  {
+   "q": "What does placement new `new (buf) Order{...}` do?",
+   "options": [
+    "Constructs an Order in the existing memory at buf without allocating",
+    "Allocates an Order next to buf",
+    "Copies buf into a new heap Order",
+    "Allocates on the stack"
+   ],
+   "answer": 0,
+   "explanation": "Placement new only runs the constructor at the given address, which is how pools and vectors construct elements in pre-allocated storage. You destroy with an explicit p->~Order().",
+   "distractors": "No allocation happens at all, which is the point.",
+   "source": "lecture",
+   "id": "L03-m10"
+  },
+  {
+   "q": "What is the main problem with this push_back from the class Vector, when `main` pushes 6000 elements into `Vector obj{N}` with N = 100?\n\n    void push_back(int64_t value) { this->arr[index++] = value; }",
+   "options": [
+    "It is O(n) per push",
+    "It throws std::out_of_range",
+    "It reallocates too often",
+    "There is no capacity check, so writes past the 100-element heap buffer are a heap overflow (UB)"
+   ],
+   "answer": 3,
+   "explanation": "Writing beyond the allocation corrupts neighbouring heap data and allocator metadata. A real vector grows (and reallocates) when size == capacity.",
+   "distractors": "Raw arrays never throw, and this code never reallocates at all.",
+   "source": "lecture",
+   "id": "L03-m11"
+  },
+  {
+   "q": "The class Vector allocates in its constructor but has no destructor. If you add `~Vector(){ delete[] arr; }` and nothing else, what happens with `Vector b = a;`?",
+   "options": [
+    "A deep copy is made automatically",
+    "Both objects share the pointer, so it is deleted twice when they are destroyed: a double free",
+    "It does not compile",
+    "b is empty"
+   ],
+   "answer": 1,
+   "explanation": "The implicit copy constructor copies the pointer member (a shallow copy). Rule of three: if you need a destructor, you need a copy constructor and copy assignment (or delete them).",
+   "distractors": "The compiler-generated copy compiles fine and is shallow, not deep.",
+   "source": "lecture",
+   "id": "L03-m12"
+  },
+  {
+   "q": "Why do HFT systems avoid heap allocation on the hot path even with a fast allocator?",
+   "options": [
+    "Because the heap is not thread-safe",
+    "Because heap memory is slower RAM",
+    "Because allocation latency is unpredictable (locks, syscalls, page faults, cache misses on fresh memory) and the tail latency matters",
+    "Because new is forbidden in C++20"
+   ],
+   "answer": 2,
+   "explanation": "The occasional slow path and the cold memory it returns are what blow a microsecond budget. Pre-allocation makes the cost deterministic.",
+   "distractors": "malloc is thread-safe, the RAM is the same, and new is legal.",
+   "source": "lecture",
+   "id": "L03-m13"
+  },
+  {
+   "q": "What is the purpose of `mlockall(MCL_CURRENT | MCL_FUTURE)` at start-up in a trading process?",
+   "options": [
+    "To lock a mutex for all threads",
+    "To make memory read-only",
+    "To allocate huge pages automatically",
+    "To keep all current and future pages resident in RAM so they are never swapped out (no major page faults)"
+   ],
+   "answer": 3,
+   "explanation": "Combined with pre-touching memory, it removes paging from the hot path.",
+   "distractors": "It is unrelated to mutexes, protection or huge pages.",
+   "source": "lecture",
+   "id": "L03-m14"
+  },
+  {
+   "q": "What are the complexities of alloc and free in a fixed-size free-list pool?",
+   "options": [
+    "O(1) and O(1)",
+    "O(log n) and O(1)",
+    "O(n) and O(n)",
+    "O(1) and O(n)"
+   ],
+   "answer": 0,
+   "explanation": "Alloc pops the head of the free list and free pushes onto it: a couple of pointer operations each.",
+   "distractors": "There is no searching. That is the point of fixed-size slots.",
+   "source": "lecture",
+   "id": "L03-m15"
+  },
+  {
+   "q": "Why does a fixed-size object pool not suffer external fragmentation?",
+   "options": [
+    "It defragments in a background thread",
+    "Every slot is the same size, so any freed slot can satisfy the next request",
+    "It uses the stack",
+    "It never frees memory"
+   ],
+   "answer": 1,
+   "explanation": "External fragmentation arises when holes are the wrong size. With uniform slots, every hole fits.",
+   "distractors": "Pools do recycle slots, and they need no compaction thread or stack storage.",
+   "source": "lecture",
+   "id": "L03-m16"
+  },
+  {
+   "q": "Free memory totals 1 MB but is scattered in 64-byte holes, so a 4 KB request forces the heap to grow. What is this?",
+   "options": [
+    "Internal fragmentation",
+    "A memory leak",
+    "External fragmentation",
+    "Stack overflow"
+   ],
+   "answer": 2,
+   "explanation": "There is enough total free space, but no contiguous block large enough.",
+   "distractors": "Internal fragmentation is waste inside allocated blocks. A leak is unreachable allocated memory.",
+   "source": "lecture",
+   "id": "L03-m17"
+  },
+  {
+   "q": "A 17-byte request is rounded up to a 32-byte chunk. What do you call the 15 wasted bytes?",
+   "options": [
+    "Internal fragmentation",
+    "External fragmentation",
+    "Padding UB",
+    "False sharing"
+   ],
+   "answer": 0,
+   "explanation": "The waste is inside the allocated block, caused by size classes, alignment and headers.",
+   "distractors": "External fragmentation is between blocks. False sharing is a cache-coherence issue.",
+   "source": "lecture",
+   "id": "L03-m18"
+  },
+  {
+   "q": "What does an arena (bump) allocator's `reset()` typically do?",
+   "options": [
+    "Calls free on every object individually",
+    "Sets the offset back to 0, releasing every allocation in O(1) (destructors are not run unless you run them)",
+    "Defragments the buffer",
+    "Returns the buffer to the OS with munmap"
+   ],
+   "answer": 1,
+   "explanation": "Bump allocators trade individual frees for O(1) bulk release, which is ideal for per-message or per-batch scratch data with one shared lifetime.",
+   "distractors": "It doesn't walk objects or call the OS. That is why it's cheap.",
+   "source": "lecture",
+   "id": "L03-m19"
+  },
+  {
+   "q": "What does this do?\n\n    std::array<std::byte, 4096> buf;\n    std::pmr::monotonic_buffer_resource res{buf.data(), buf.size()};\n    std::pmr::vector<int> v{&res};\n    v.reserve(100);",
+   "options": [
+    "Allocates 100 ints with malloc",
+    "Fails to compile: pmr needs a heap",
+    "Allocates 4096 ints on the heap",
+    "Carves the 400 bytes for 100 ints out of the stack buffer: no malloc"
+   ],
+   "answer": 3,
+   "explanation": "The monotonic resource bump-allocates from the supplied buffer, and falls back to its upstream (new_delete by default) only if the buffer runs out.",
+   "distractors": "pmr containers are designed exactly to work with such buffers.",
+   "source": "lecture",
+   "id": "L03-m20"
+  },
+  {
+   "q": "Which member is NOT required for a minimal C++17 custom allocator used with std::vector?",
+   "options": [
+    "value_type",
+    "allocate(n)",
+    "construct(p, args...)",
+    "deallocate(p, n)"
+   ],
+   "answer": 2,
+   "explanation": "std::allocator_traits supplies construct and destroy (using placement new), so a minimal allocator needs only value_type, allocate, deallocate, a converting constructor and equality.",
+   "distractors": "The other three are the core required members.",
+   "source": "lecture",
+   "id": "L03-m21"
+  },
+  {
+   "q": "What is a cost of using `std::pmr::vector` instead of `std::vector` with a custom allocator?",
+   "options": [
+    "Each allocation goes through a virtual call on memory_resource, and the container carries an extra pointer",
+    "It cannot store user-defined types",
+    "It is always heap-allocated",
+    "Iteration becomes O(log n)"
+   ],
+   "answer": 0,
+   "explanation": "pmr uses run-time polymorphism (do_allocate is virtual) to avoid baking the allocator into the type. The cost is small but non-zero.",
+   "distractors": "Element access and iteration are identical, and pmr can use stack buffers.",
+   "source": "lecture",
+   "id": "L03-m22"
+  },
+  {
+   "q": "Which approach best prevents fragmentation in a long-running order gateway?",
+   "options": [
+    "Allocating each message with new and freeing it with delete",
+    "Fixed-size pools per object type, pre-allocated at start-up, with short-lived scratch data in a per-batch arena",
+    "Using std::list for everything",
+    "Calling malloc_trim every millisecond"
+   ],
+   "answer": 1,
+   "explanation": "Uniform slot sizes plus arenas that share a lifetime eliminate the size and lifetime mixing that causes fragmentation.",
+   "distractors": "Per-message new/delete and node containers create the problem, and malloc_trim on the hot path adds syscalls.",
+   "source": "lecture",
+   "id": "L03-m23"
+  }
+ ],
+ "msqs": [
+  {
+   "q": "Which statements about stack allocation are true? (select all that apply)",
+   "options": [
+    "It costs about one instruction (adjusting rsp)",
+    "It is limited to around 8 MiB per thread by default on Linux",
+    "Objects on the stack can safely be returned by pointer",
+    "Destructors of stack objects run automatically at scope exit",
+    "Stack memory is a separate, faster type of RAM"
+   ],
+   "answers": [
+    0,
+    1,
+    3
+   ],
+   "explanation": "The stack is cheap, bounded and automatic (RAII). Returning a pointer to a local dangles, and the speed comes from cheap allocation and cache hotness, not special RAM.",
+   "id": "L03-x1"
+  },
+  {
+   "q": "Which of the following involve the heap allocator? (select all that apply)",
+   "options": [
+    "std::vector<int> v(1000);",
+    "int a[1000];  (local)",
+    "auto p = std::make_unique<Order>();",
+    "std::string s(100, 'x');",
+    "std::array<int, 1000> a;  (local)"
+   ],
+   "answers": [
+    0,
+    2,
+    3
+   ],
+   "explanation": "vector's buffer, make_unique and a 100-character string (beyond SSO) all allocate. A local C array and std::array live in the stack frame.",
+   "id": "L03-x2"
+  },
+  {
+   "q": "Which pairings are correct? (select all that apply)",
+   "options": [
+    "new T with delete p",
+    "new T[n] with free(p)",
+    "malloc with delete p",
+    "new (buf) T with delete p",
+    "malloc with free"
+   ],
+   "answers": [
+    0,
+    4
+   ],
+   "explanation": "Allocation and deallocation must match: new/delete and malloc/free are correct pairs. new[] needs delete[] (not free), malloc memory must go back through free (not delete), and placement new did not allocate, so you call p->~T() instead of delete.",
+   "id": "L03-x3"
+  },
+  {
+   "q": "Which events can make a single `new` take microseconds instead of nanoseconds? (select all that apply)",
+   "options": [
+    "The arena must grow via brk or mmap (a syscall)",
+    "First touch of fresh pages causes page faults",
+    "Contention on an allocator lock between threads",
+    "The object has a trivial constructor",
+    "A cache hit in the per-thread tcache"
+   ],
+   "answers": [
+    0,
+    1,
+    2
+   ],
+   "explanation": "Syscalls, page faults and lock contention are the slow paths. A trivial constructor and a tcache hit are what make the fast path fast.",
+   "id": "L03-x4"
+  },
+  {
+   "q": "Which are good low-latency memory practices? (select all that apply)",
+   "options": [
+    "Pre-allocate pools and reserve containers at start-up",
+    "Touch (pre-fault) memory and mlock it before trading starts",
+    "Allocate a new std::string for every log line on the hot path",
+    "Use huge pages for large pools or books to reduce TLB misses",
+    "Free memory back to the OS with munmap after each message"
+   ],
+   "answers": [
+    0,
+    1,
+    3
+   ],
+   "explanation": "Pre-allocation, pre-faulting, mlock and huge pages make memory costs deterministic. Per-message allocation and munmap (with TLB shootdowns) add exactly the jitter you are trying to remove.",
+   "id": "L03-x5"
+  },
+  {
+   "q": "Which statements about the class programming exercise (stack-only Order/Trader version, verified with strace) are true? (select all that apply)",
+   "options": [
+    "Using std::array<Order,100> reused each second needs no heap allocation",
+    "Storing the trader name in a std::string of more than 15 characters can allocate",
+    "strace will show brk/mmap calls during process start-up even for the stack version",
+    "A std::vector<Order> created inside the loop is still stack-only",
+    "strace lets you verify there are no memory syscalls inside the loop"
+   ],
+   "answers": [
+    0,
+    1,
+    2,
+    4
+   ],
+   "explanation": "std::array lives in the frame, long std::strings allocate beyond SSO, and the loader and libc map memory at start-up, so you check that the steady-state loop is quiet. A vector's buffer is always on the heap.",
+   "id": "L03-x6"
+  },
+  {
+   "q": "Which problems exist in the class `Vector` (constructor does `arr = new int64_t[sz]`, push_back does `arr[index++] = v`, no destructor)? (select all that apply)",
+   "options": [
+    "push_back has no capacity check (heap overflow if more than sz elements)",
+    "The buffer is never freed (leak)",
+    "A copy of the object would share the buffer (shallow copy)",
+    "push_back is O(log n)",
+    "It cannot store negative numbers"
+   ],
+   "answers": [
+    0,
+    1,
+    2
+   ],
+   "explanation": "Missing bounds or growth logic, a missing destructor and missing copy control are the three defects (Rule of 3). push_back is O(1), and int64_t holds negatives fine.",
+   "id": "L03-x7"
+  },
+  {
+   "q": "Which statements about an object pool (fixed-size free list) are true? (select all that apply)",
+   "options": [
+    "Allocation and deallocation are O(1)",
+    "It avoids external fragmentation",
+    "It can allocate objects of any size",
+    "It needs its capacity decided in advance (or a growth policy)",
+    "It is automatically thread-safe"
+   ],
+   "answers": [
+    0,
+    1,
+    3
+   ],
+   "explanation": "Pools are fast, fragmentation-free and bounded. They serve one size, and thread safety must be designed in (per-thread pools or a lock-free list).",
+   "id": "L03-x8"
+  },
+  {
+   "q": "Which are causes or effects of heap fragmentation? (select all that apply)",
+   "options": [
+    "Interleaving long-lived and short-lived allocations of many sizes",
+    "Growing RSS even though total live data is constant",
+    "Worse cache and TLB locality",
+    "Using a single fixed-size pool per type",
+    "Allocations that fail or force heap growth despite enough total free memory"
+   ],
+   "answers": [
+    0,
+    1,
+    2,
+    4
+   ],
+   "explanation": "Mixed sizes and lifetimes create holes, which leads to growth, scattered data and failed contiguous requests. Fixed-size pools are a cure, not a cause.",
+   "id": "L03-x9"
+  },
+  {
+   "q": "Which statements about `std::pmr` are true? (select all that apply)",
+   "options": [
+    "monotonic_buffer_resource frees memory only when it is released or destroyed",
+    "pmr containers allocate via a virtual call on memory_resource",
+    "unsynchronized_pool_resource is safe to share between threads without locks",
+    "A pmr::vector can allocate from a stack buffer",
+    "null_memory_resource() throws on any allocation, which is useful to detect unexpected heap use"
+   ],
+   "answers": [
+    0,
+    1,
+    3,
+    4
+   ],
+   "explanation": "Monotonic is bump-style, pmr uses run-time polymorphism, and buffers can be on the stack. null_memory_resource throws bad_alloc. The unsynchronized pool is NOT thread-safe: that's what synchronized_pool_resource is for.",
+   "id": "L03-x10"
+  },
+  {
+   "q": "Which of the following are true about virtual memory and pages on Linux x86-64? (select all that apply)",
+   "options": [
+    "The default page size is 4 KiB",
+    "Physical memory is typically assigned on first touch of a page",
+    "RSS includes reserved but never-touched pages",
+    "Huge pages are 2 MiB (or 1 GiB)",
+    "mmap of anonymous memory immediately zero-fills all pages in RAM"
+   ],
+   "answers": [
+    0,
+    1,
+    3
+   ],
+   "explanation": "Pages are 4 KiB and huge pages 2 MiB or 1 GiB, and frames are faulted in lazily. RSS counts only resident (touched) pages, and anonymous mmap is lazy unless you pass MAP_POPULATE.",
+   "id": "L03-x11"
+  },
+  {
+   "q": "Which are required (or must be provided) for a minimal custom allocator usable with std::vector in C++17? (select all that apply)",
+   "options": [
+    "using value_type = T;",
+    "T* allocate(std::size_t n)",
+    "void deallocate(T* p, std::size_t n)",
+    "A rebind member template (it is always mandatory)",
+    "A virtual destructor"
+   ],
+   "answers": [
+    0,
+    1,
+    2
+   ],
+   "explanation": "value_type, allocate and deallocate (plus a converting constructor and ==) are the minimum. allocator_traits derives rebind from a template allocator, and allocators need no virtual destructor.",
+   "id": "L03-x12"
+  },
+  {
+   "q": "Which statements about `tcmalloc`/`jemalloc` compared with glibc malloc are true? (select all that apply)",
+   "options": [
+    "They use per-thread caches to reduce lock contention",
+    "They guarantee constant-time allocation with no tail latency",
+    "They make heap allocation free, so it is fine on the hot path",
+    "They can be swapped in at link time or with LD_PRELOAD without code changes",
+    "They eliminate the need for delete"
+   ],
+   "answers": [
+    0,
+    3
+   ],
+   "explanation": "They are drop-in faster allocators with per-thread caches (and size classes). They still have slow paths (refilling caches from central lists, mmap), so they guarantee neither constant time nor free allocation, and they do not replace manual or RAII deallocation.",
+   "id": "L03-x13"
+  }
+ ],
+ "short": [
+  {
+   "q": "Compare stack and heap allocation in C++: cost, lifetime, size limits and cache behaviour. When is each appropriate in a low-latency system?",
+   "checks": [
+    {
+     "label": "Stack allocation is a stack-pointer bump / ~free",
+     "patterns": [
+      "rsp|stack pointer|one instruction|single instruction|essentially free|~?0 ?ns"
+     ]
+    },
+    {
+     "label": "Heap goes through malloc / allocator / possible syscall",
+     "patterns": [
+      "malloc|allocator|syscall|brk|mmap"
+     ]
+    },
+    {
+     "label": "Mentions stack size limit (8 MiB)",
+     "patterns": [
+      "8 ?mi?b|limit"
+     ]
+    },
+    {
+     "label": "Mentions lifetime (scope vs manual / outlive)",
+     "patterns": [
+      "scope|outlive|lifetime"
+     ]
+    },
+    {
+     "label": "Mentions cache / locality",
+     "patterns": [
+      "cache|locality"
+     ]
+    }
+   ],
+   "modelAnswer": "**Stack:** allocation is a single `sub rsp` (essentially free), with no allocator, lock or syscall. Memory is released automatically at **scope** exit, with destructors run in reverse order. The top of the stack is hot in L1, so locality is excellent. The size must be known at compile time and the total is limited to about **8 MiB** per thread by default, and objects cannot outlive the function.\n\n**Heap:** `new` goes through `operator new`, then `malloc`, then the allocator. The fast path is about 20–100 ns from thread caches, and the slow path involves `brk`/`mmap` syscalls, page faults and lock contention (microseconds, an unpredictable tail). The size can be decided at run time and the lifetime is controlled by the program, so objects can outlive the creating scope. The returned memory may be cold and scattered, which hurts the cache.\n\n**In low-latency code:** use the stack (and `std::array`) for small, scoped data. Use the heap only at start-up to pre-allocate pools, ring buffers and `reserve()`d vectors, then reuse that memory. Nothing on the hot path should call `new`.",
+   "explanation": "The examiner wants concrete costs, lifetimes, limits and the cache angle, tied to the no-allocation-on-hot-path rule.",
+   "id": "L03-s1"
+  },
+  {
+   "q": "Explain what happens, step by step, when you write `Order* o = new Order{1, 100, 5};` and later `delete o;`, including what can make it slow.",
+   "checks": [
+    {
+     "label": "operator new / malloc allocates first",
+     "patterns": [
+      "operator new|malloc"
+     ]
+    },
+    {
+     "label": "Then the constructor runs",
+     "patterns": [
+      "constructor"
+     ]
+    },
+    {
+     "label": "delete runs destructor then frees",
+     "patterns": [
+      "destructor"
+     ]
+    },
+    {
+     "label": "Mentions syscall brk/mmap or page faults on slow path",
+     "patterns": [
+      "brk|mmap|page fault|syscall"
+     ]
+    },
+    {
+     "label": "Mentions thread cache / fast path / lock contention",
+     "patterns": [
+      "tcache|thread[- ]cache|fast path|lock|contention"
+     ]
+    }
+   ],
+   "modelAnswer": "1. `new` calls **`operator new(sizeof(Order))`**, which (by default) calls **`malloc`**. glibc first tries the per-thread `tcache` or free bins (the **fast path**, tens of ns). If there is no suitable chunk, it takes an arena lock, splits or consolidates chunks and, if the arena is exhausted, grows it with **`brk`** (or uses **`mmap`** for blocks ≥ ~128 KiB): a **syscall**. The first write to fresh pages then triggers **page faults**. On failure, `std::bad_alloc` is thrown.\n2. The **constructor** `Order{1,100,5}` runs in that memory.\n3. `delete o;` runs the **destructor** `~Order()`, then calls `operator delete`, which calls `free`, returning the chunk to the tcache or bins (possibly coalescing with neighbours, or `munmap` for large blocks).\n\nSlow cases: syscalls, page faults, **lock contention** between threads, consolidation work, and cache misses because the memory is cold. That unpredictability is why the hot path uses pre-allocated pools instead.",
+   "explanation": "The examiner wants the two-phase nature of new and delete and the sources of latency.",
+   "id": "L03-s2"
+  },
+  {
+   "q": "Write a simple fixed-size object pool for `Order` objects (O(1) acquire and release, no heap use after construction) and explain why it is better than new/delete for an order gateway.",
+   "checks": [
+    {
+     "label": "Uses a free list (next pointer)",
+     "patterns": [
+      "free[_ ]?list|next"
+     ]
+    },
+    {
+     "label": "Uses placement new to construct",
+     "patterns": [
+      "new\\s*\\(|placement"
+     ]
+    },
+    {
+     "label": "Explicit destructor call on release",
+     "patterns": [
+      "->~|~Order|~T"
+     ]
+    },
+    {
+     "label": "States O(1)",
+     "patterns": [
+      "O\\(1\\)"
+     ]
+    },
+    {
+     "label": "Mentions no fragmentation / no syscalls / deterministic",
+     "patterns": [
+      "fragment|syscall|determinis|predictab"
+     ]
+    }
+   ],
+   "modelAnswer": "```cpp\ntemplate <typename T, size_t N>\nclass Pool {\n    union Slot { Slot* next; alignas(T) unsigned char mem[sizeof(T)]; };\n    std::array<Slot, N> slots_;          // one contiguous block, allocated once\n    Slot* free_list = nullptr;\npublic:\n    Pool() { for (auto& s : slots_) { s.next = free_list; free_list = &s; } }\n    template <class... A> T* acquire(A&&... a) {\n        if (!free_list) return nullptr;              // capacity was sized up front\n        Slot* s = free_list; free_list = s->next;    // O(1) pop\n        return new (s->mem) T(std::forward<A>(a)...);// placement new: construct in place\n    }\n    void release(T* p) {\n        p->~T();                                     // explicit destructor call\n        Slot* s = reinterpret_cast<Slot*>(p);\n        s->next = free_list; free_list = s;          // O(1) push\n    }\n};\nstatic Pool<Order, 1'000'000> pool;   // static storage: allocated and pre-faulted at start-up\n```\n\nWhy it beats `new`/`delete`: acquire and release are O(1) pointer swaps (a few ns), with **no syscalls**, no allocator locks and no page faults after warm-up, so latency is **deterministic**. All slots are the same size, so there is **no fragmentation**, and the orders sit in one contiguous block, which is good for cache and TLB. The costs are a fixed capacity and that it is single-threaded as written (use one pool per thread).",
+   "explanation": "The examiner expects a free list, placement new and an explicit destructor, the O(1) claim, and the latency or fragmentation argument.",
+   "id": "L03-s3"
+  },
+  {
+   "q": "What is memory fragmentation? Distinguish internal and external fragmentation and list techniques used in low-latency systems to prevent it.",
+   "checks": [
+    {
+     "label": "External: free memory in unusable holes",
+     "patterns": [
+      "external"
+     ]
+    },
+    {
+     "label": "Internal: waste inside allocated blocks",
+     "patterns": [
+      "internal"
+     ]
+    },
+    {
+     "label": "Mentions pools / fixed-size",
+     "patterns": [
+      "pool|fixed[- ]size"
+     ]
+    },
+    {
+     "label": "Mentions arenas / monotonic / bump",
+     "patterns": [
+      "arena|monotonic|bump"
+     ]
+    },
+    {
+     "label": "Mentions pre-allocation / reserve",
+     "patterns": [
+      "pre-?allocat|reserve|up front|start-?up"
+     ]
+    }
+   ],
+   "modelAnswer": "**Fragmentation** is when free memory cannot be used efficiently.\n\n- **External fragmentation:** the total free memory is large, but it is split into small non-contiguous holes, so a bigger request cannot be satisfied and the allocator must grow the heap (syscalls, rising RSS, scattered data, worse cache and TLB behaviour). It comes from mixing allocation sizes and lifetimes over a long run.\n- **Internal fragmentation:** wasted space *inside* allocated blocks, from rounding up to size classes or alignment plus allocator headers (a 17 B request using a 32 B chunk).\n\nPrevention in low-latency systems:\n\n1. **Pre-allocate** everything at start-up (`reserve`, ring buffers, static storage) and reuse it.\n2. **Fixed-size pools** per object type: any freed slot fits the next request, so there is no external fragmentation.\n3. **Arena, bump or monotonic allocators** (`std::pmr::monotonic_buffer_resource`) for data that shares a lifetime, freed all at once with `reset`.\n4. Separate long-lived from short-lived allocations, use size-class allocators (tcmalloc, jemalloc), and prefer contiguous containers over node-based ones.",
+   "explanation": "The examiner wants the two definitions plus concrete prevention techniques.",
+   "id": "L03-s4"
+  },
+  {
+   "q": "Predict and explain the behaviour of the two class programs below when each is run under `strace` and watched with `top` (RSS):\n\n    // A\n    void func() { int arr[1024*1024]; }\n    // B\n    void func() { int* arr = new int[1024*2024]; delete arr; }\n    // both: while(1){ func(); sleep 1s; }",
+   "checks": [
+    {
+     "label": "A: no syscalls / just rsp adjustment",
+     "patterns": [
+      "no (memory )?syscalls?|rsp|stack pointer"
+     ]
+    },
+    {
+     "label": "A: RSS flat because pages never touched",
+     "patterns": [
+      "never touched|untouched|not touched|flat|first touch"
+     ]
+    },
+    {
+     "label": "B: mmap/munmap for large allocation",
+     "patterns": [
+      "mmap"
+     ]
+    },
+    {
+     "label": "B: delete should be delete[] (UB)",
+     "patterns": [
+      "delete\\[\\]"
+     ]
+    },
+    {
+     "label": "Mentions the mmap threshold / large allocation",
+     "patterns": [
+      "threshold|128 ?ki?b|large"
+     ]
+    }
+   ],
+   "modelAnswer": "**A (stack, 4 MiB):** each call just moves the stack pointer (`sub rsp, ~4 MiB`) and back, with **no memory syscalls** in `strace`. 4 MiB is under the 8 MiB stack limit, so it doesn't overflow. The array is **never touched**, so its pages are never faulted in, and RSS stays **flat** (only the first touch of a page makes it resident). At `-O2` the unused array is removed entirely.\n\n**B (heap, ~7.9 MiB):** the request is far above glibc's **mmap threshold** (128 KiB by default, adjusted dynamically), so `strace` shows an `mmap` of about 8 MB for the block and a `munmap` when it is freed (later iterations may switch to `brk` once glibc raises the threshold). `new int[]` doesn't initialise ints and nothing touches them, so RSS barely moves either, but each iteration pays for syscalls. Also, `delete arr` is wrong: memory from `new[]` must be freed with **`delete[] arr`**. The mismatch is UB even though it seems to work for `int`.",
+   "explanation": "The examiner is testing that you understand stack bumping, lazy page faulting, glibc mmap behaviour and the delete[] rule together.",
+   "id": "L03-s5"
+  },
+  {
+   "q": "Write a minimal bump (arena) allocator with alloc(n, align) and reset(), and explain its alignment rounding and when it is appropriate.",
+   "checks": [
+    {
+     "label": "Keeps an offset into a buffer",
+     "patterns": [
+      "off(set)?_?"
+     ]
+    },
+    {
+     "label": "Rounds up to alignment with mask arithmetic",
+     "patterns": [
+      "align\\s*-\\s*1|~\\s*\\(\\s*align"
+     ]
+    },
+    {
+     "label": "reset sets offset to 0 / frees all at once",
+     "patterns": [
+      "reset|all at once|= ?0"
+     ]
+    },
+    {
+     "label": "No individual free",
+     "patterns": [
+      "individual|no(-op| per-object)? free|cannot free|never frees"
+     ]
+    },
+    {
+     "label": "Appropriate for same-lifetime / per-message / per-batch data",
+     "patterns": [
+      "lifetime|per[- ](message|batch|request|frame|tick)"
+     ]
+    }
+   ],
+   "modelAnswer": "```cpp\nclass Arena {\n    std::byte* buf_; size_t cap_; size_t off_ = 0;\npublic:\n    Arena(std::byte* b, size_t cap) : buf_(b), cap_(cap) {}\n    void* alloc(size_t n, size_t align) {          // align must be a power of two\n        size_t p = (off_ + align - 1) & ~(align - 1);   // round the offset up to a multiple of align\n        if (p + n > cap_) return nullptr;          // out of space\n        off_ = p + n;\n        return buf_ + p;\n    }\n    void reset() { off_ = 0; }                     // frees everything at once, O(1)\n};\n```\n\n`(off + align - 1) & ~(align - 1)` rounds the offset up to the next multiple of `align`. For example, off = 13 and align = 8 gives (20) & ~7 = 16. That works because `align` is a power of two, so `~(align-1)` clears the low bits.\n\nAllocation is an add, a mask and a compare: a few ns, with no syscalls or locks. There is **no individual free**, only `reset`. Destructors are not run, so it suits trivially destructible data, or you call them yourself. It is appropriate when many objects share one **lifetime**: per-message decode scratch, per-batch or per-tick temporary data, or start-up tables. It is wrong for objects with independent lifetimes, which need a pool.",
+   "explanation": "The examiner wants the offset bump, the power-of-two alignment trick and the lifetime trade-off.",
+   "id": "L03-s6"
+  }
+ ],
+ "quiz": [],
+ "coding": [
+  {
+   "id": "memory-pool",
+   "title": "Memory Pool"
+  },
+  {
+   "id": "fixed-lru-cache",
+   "title": "Allocation-Free LRU Cache"
+  }
+ ],
+ "prev": {
+  "num": 2,
+  "file": "lecture-02.html"
+ },
+ "next": {
+  "num": 4,
+  "file": "lecture-04.html"
+ }
+};
