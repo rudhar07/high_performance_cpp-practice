@@ -215,7 +215,7 @@ th { background: var(--surface-2); }
 
 /* ---------- Colour schemes ----------
    Light mode: cream (warm cream page, off-white cards, dark-brown text, terracotta accent, sand buttons).
-   Dark mode:  purple (#160026 page, #CCCCFF buttons, dark cards). */
+   Dark mode:  purple (#0C0016 page, #CCCCFF buttons, dark cards). */
 :root {
   --bg: #F6EFDF; --surface: #FFFBF2; --surface-2: #F4EBD9; --text: #33281C; --muted: #6F5F4B;
   --border: #E2D4B9; --accent: #96401F; --accent-soft: #F6E1D3; --code-bg: #F0E5CE;
@@ -227,14 +227,14 @@ th { background: var(--surface-2); }
   --rule: #E2D4B9;
 }
 :root[data-theme="dark"] {
-  --page-bg: #160026; --btn-bg: #CCCCFF; --btn-bg-hover: #B8B8F5; --btn-text: #1E1452;
+  --page-bg: #0C0016; --btn-bg: #CCCCFF; --btn-bg-hover: #B8B8F5; --btn-text: #1E1452;
   --on-page: #FFFFFF; --on-page-muted: rgba(255, 255, 255, .88);
   --accent: #B3A4F5; --accent-soft: #2E2560; --pill-bg: #FFFFFF; --pill-text: #3B2A9A;
   --rule: rgba(255, 255, 255, .3);
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-  --page-bg: #160026; --btn-bg: #CCCCFF; --btn-bg-hover: #B8B8F5; --btn-text: #1E1452;
+  --page-bg: #0C0016; --btn-bg: #CCCCFF; --btn-bg-hover: #B8B8F5; --btn-text: #1E1452;
   --on-page: #FFFFFF; --on-page-muted: rgba(255, 255, 255, .88);
   --accent: #B3A4F5; --accent-soft: #2E2560; --pill-bg: #FFFFFF; --pill-text: #3B2A9A;
   --rule: rgba(255, 255, 255, .3);
