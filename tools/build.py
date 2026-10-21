@@ -152,6 +152,12 @@ CODING_BODY = """  <div class="crumbs"><a href="../index.html">All sessions</a> 
   <h1>Coding practice</h1>
   <p class="sub">The exam includes C++ coding questions in exactly this format (description, signature, constraints, example). Here is the course's Memory Pool problem plus similar low-latency C++ problems, each with hints, a key-idea checker and a solution that was compiled and tested with sanitizers. After those, similar problems on LeetCode and other platforms.</p>
   <div class="score-line"><span id="score"></span></div>
+  <nav class="section-nav" aria-label="Sections">
+    <a class="btn" href="#sec-problems">💻 Coding problems (12)</a>
+    <a class="btn" href="#sec-leetcode">LeetCode links</a>
+    <a class="btn" href="#sec-other">GfG / HackerRank / Codeforces</a>
+  </nav>
+  <h2 id="sec-problems">Exam-style coding problems</h2>
   <div class="toc" id="toc"></div>
   <div id="problems"></div>
   <h2 id="sec-leetcode">Similar problems on LeetCode</h2>
@@ -168,6 +174,7 @@ INDEX_BODY = """  <h1>High Performance C++: End-term Revision</h1>
   <div class="grid" id="grid"></div>
   <h2>Coding practice</h2>
   <div class="grid" id="quiz-grid"></div>
+  <p class="sub" style="margin-top:10px">Jump to: <a href="coding/index.html#sec-problems">coding problems</a> · <a href="coding/index.html#sec-leetcode">LeetCode links</a> · <a href="coding/index.html#sec-other">GfG / HackerRank / Codeforces links</a></p>
   <p style="margin-top:20px"><button class="btn" id="reset-all" type="button">Reset all progress</button></p>
 """
 
