@@ -1,4 +1,4 @@
-# High Performance C++: End-term Revision
+# High Performance C++: Revision
 
 An interactive revision site for **High Performance C++** (low-latency / HFT C++): 14 sessions, each with one-shot notes,
 key terms, MCQs, multi-select questions (MSQs) and written questions, plus exam-style C++ coding problems with tested
