@@ -1,0 +1,891 @@
+{
+ "num": 12,
+ "title": "Fast Orderbooks",
+ "summary": "How a limit order book works (bids, asks, levels, BBO, spread), price-time priority, the order types and the matching algorithm, worked through the class RELIANCE example. Then the data structures from class (priority_queue with lazy deletion, multiset, std::map of levels) and the faster flat ones (sorted vectors, tick-indexed arrays, intrusive lists, id hash maps), with their complexity and cache behaviour.",
+ "notes": [
+  {
+   "heading": "What an order book is: bids, asks, BBO, spread",
+   "body": "An **order book** is the exchange's list of all resting (not yet executed) limit orders for one instrument, split into two sides:\n\n- **Bids**: how much people are willing to **buy** at each price. Best bid = **highest** bid price.\n- **Asks** (offers): how much people are willing to **sell** at each price. Best ask = **lowest** ask price.\n\n**In class** we drew it for RELIANCE:\n\n```\n   bids (buy)        asks (sell)\n   100   @ 30        101\n   99                102\n   98.5              103\n```\n\nKey derived quantities:\n\n| Term | Meaning |\n|---|---|\n| **BBO** (best bid and offer, top of book) | Best bid price/qty and best ask price/qty |\n| **Spread** | best ask - best bid (here 101 - 100 = 1) |\n| **Mid price** | (best bid + best ask) / 2 = 100.5 |\n| **Depth** | Total quantity available at the top N levels |\n| **Crossed book** | best bid >= best ask; a matching engine never leaves it like that (it would trade) |\n\nIn a normal book best bid < best ask. An incoming order that **crosses** the spread (a buy at >= best ask, a sell at <= best bid) trades immediately; otherwise it **rests** in the book."
+  },
+  {
+   "heading": "Price levels and market-data depth (L1, L2, L3)",
+   "body": "A **price level** groups all resting orders at one price on one side. It stores at least the aggregate quantity and, for an exchange or a market-by-order book, a FIFO queue of the individual orders.\n\n```cpp\nusing Price = std::int64_t;   // price in integer ticks, never double\nusing Qty   = std::int64_t;\n\nstruct Level {\n    Price price;\n    Qty   total_qty;          // sum of the queue: what market-by-price feeds publish\n    // FIFO of orders at this price (for price-time priority)\n};\n```\n\n| Feed | Content | Typical use |\n|---|---|---|\n| **L1** | Best bid/ask price and size only (BBO) | Simple quoting, displays |\n| **L2 / market-by-price (MBP)** | Aggregate qty per price level, top N levels | Most strategies |\n| **L3 / market-by-order (MBO)** | Every individual order with its id, add/modify/cancel/execute events | Queue-position modelling, exchange-side matching |\n\nA trading firm usually rebuilds the book from the exchange feed (add / modify / delete / trade messages); the exchange runs the **matching engine** that owns the real book.\n\n**Prices as integers:** store prices in ticks (e.g. 100.50 with tick 0.05 becomes 2010). Doubles are inexact (`0.1 + 0.2 != 0.3`), dangerous as map keys and for equality, and integer compares are faster."
+  },
+  {
+   "heading": "Price-time priority (FIFO) and alternatives",
+   "body": "**In class** the first requirement written down was: *the order book has to support price-time priority*.\n\n1. **Price priority**: a better price always executes first (higher bid, lower ask).\n2. **Time priority**: among orders at the same price, the one that arrived **first** executes first (FIFO).\n\n```cpp\nstruct Order {                 // the class struct, with safer types\n    std::uint64_t id;\n    Side          side;        // Buy or Sell\n    Price         price;       // ticks\n    Qty           qty;\n    std::uint64_t timestampNs; // arrival time; the class notes used uint (32-bit)\n};\n```\n\nFrom the class example `bids {100 @ 10, 100 @ 10, 99 @ 20}`: two orders of 10 at price 100. The one with the earlier timestamp is filled first; the 99 order only trades after both 100s are gone.\n\nNote on the class `uint timestampNs`: a 32-bit nanosecond counter wraps after 2^32 ns = ~4.3 seconds, so real books use 64-bit timestamps (or a sequence number). Arrival order inside a level is usually implicit in the FIFO position, so the timestamp is often not needed for matching at all.\n\nAlternatives used by some exchanges: **pro-rata** (fill each order at the price in proportion to its size, common in interest-rate futures) and hybrid FIFO/pro-rata with a top-order priority."
+  },
+  {
+   "heading": "Order types and book operations",
+   "body": "| Message | Effect on the book |\n|---|---|\n| **Limit order** | Buy/sell up to qty at price P or better. The part that can trade trades now; the rest rests at P |\n| **Market order** | Trade immediately at the best available prices, walking down the levels; no price limit; leftover usually cancelled |\n| **IOC** (immediate-or-cancel) | Trade what you can now, cancel the rest; never rests |\n| **FOK** (fill-or-kill) | Fill the whole qty immediately or nothing |\n| **Post-only** | Rejected (or repriced) if it would trade immediately; only adds liquidity |\n| **Cancel** | Remove a resting order by id |\n| **Modify / amend** | Change qty or price of a resting order |\n\nModify rules matter for priority (typical exchange behaviour):\n\n- **Reduce quantity** at the same price: keeps the order's place in the queue (implemented in place, O(1)).\n- **Increase quantity** or **change price**: loses time priority; implemented as cancel + new order at the back of the queue.\n\nThe book interface **from class**:\n\n```cpp\nclass OrderBook {\npublic:\n    void addOrder(const Order& o);     // match, then rest the remainder\n    void removeOrder(std::uint64_t id);// cancel\n    /* ... */ getBids();               // levels for display / strategy\n    /* ... */ getAsks();\n    BBO getBBO();                      // top_most_bid, top_most_ask\n};\n```"
+  },
+  {
+   "heading": "Matching: worked example from class",
+   "body": "**Matching rule:** an incoming buy at limit P trades against asks with price <= P, best (lowest) ask first, FIFO within a level. An incoming sell at limit P trades against bids with price >= P, highest first. The **trade price is the resting order's price** (the passive side sets the price).\n\n**In class** (RELIANCE, all quantities in shares):\n\n1. Kartik: BUY 10 @ 100. No asks, so it rests. Bids: `100: [K1 10]`.\n2. Manik: SELL 5 @ 101. Best bid 100 < 101, no cross, rests. Asks: `101: [M 5]`.\n3. Kartik: BUY 5 @ 100.5. Best ask 101 > 100.5, rests at a new, better level. Bids: `100.5: [K2 5]`, `100: [K1 10]`. BBO: 100.5 / 101.\n4. Paras: SELL 10 @ 100. It crosses (100 <= best bid 100.5):\n   - trades 5 @ **100.5** with K2 (level 100.5 now empty and removed),\n   - next best bid 100 >= 100, trades 5 @ **100** with K1 (K1 has 5 left),\n   - Paras is fully filled.\n\nFinal book: bids `100: [K1 5]`, asks `101: [M 5]`, spread 1.\n\n```cpp\n// core of matching an incoming buy (asks: map ascending, begin() = best)\nwhile (in.qty > 0 && !asks.empty() && asks.begin()->first <= in.price) {\n    auto& lvl = asks.begin()->second;          // FIFO of resting sells\n    Order& rest = lvl.front();\n    Qty q = std::min(in.qty, rest.qty);\n    on_trade(in.id, rest.id, asks.begin()->first, q);   // trade at resting price\n    in.qty -= q; rest.qty -= q;\n    if (rest.qty == 0) { index.erase(rest.id); lvl.pop_front(); }\n    if (lvl.empty()) asks.erase(asks.begin());\n}\nif (in.qty > 0) rest_in_book(in);              // remainder becomes the new best bid\n```"
+  },
+  {
+   "heading": "Data structure options discussed in class",
+   "body": "**In class** we compared three designs:\n\n**1. `std::priority_queue` + lazy deletion.** One max-heap for bids, min-heap for asks, ordered by (price, timestamp). Adding is O(log n) and the top is the best order. But a heap cannot erase from the middle, so a cancel just records the id (class notes: `map<int,int> deleted; deleted[6]++`). When a cancelled order reaches the top, it is popped and discarded.\n- Cancel: O(1) mark (O(log n) with a `std::map` as the marker; use `unordered_set`).\n- Pop of stale entries: amortised O(log n) each.\n- Downsides: dead entries waste memory and cache until they surface; no cheap per-level aggregate quantity; modify = cancel + add.\n\n**2. `std::multiset<Order, Cmp>`.** Sorted by (price, time). Insert O(log n); erase in the middle is possible: O(1) amortised **given an iterator** (keep `unordered_map<id, iterator>`), O(log n) by key. One node allocation per order, pointer chasing.\n\n**3. `std::map<Price, Level>`** with a FIFO per price: the standard baseline. Class notes: `map<PRICE, vector<Order>> bids, map<PRICE, vector<Order>, greater<>> asks`.\n\n**Correction to the class notes:** the comparators are swapped. With the default `std::less`, `begin()` is the *lowest* key, which is the best **ask**. Bids need the highest first:\n\n```cpp\nstd::map<Price, Level, std::greater<Price>> bids;  // begin() = highest bid = best bid\nstd::map<Price, Level>                      asks;  // begin() = lowest ask = best ask\n```\n\n(With the swapped version it still works if you use `rbegin()`, but it is easy to get wrong.) Also, a `std::vector<Order>` per level makes FIFO pops from the front O(n); use `std::deque`, an intrusive list, or a vector with a head index."
+  },
+  {
+   "heading": "Faster structures: flat vectors, tick-indexed arrays, intrusive lists, id hash map",
+   "body": "**Sorted `std::vector<Level>` with the best price at the back.** Most activity happens within a few ticks of the top, so insert/erase near the back moves only a few elements (memmove of contiguous memory), and finding a level by **linear search from the back** usually stops after 1-3 elements. Contiguous memory = prefetcher-friendly, no per-level allocation.\n\n**Array indexed by price tick.** If the price range is bounded (**in class:** \"support 1000 price levels\"), `levels[(price - min_price) / tick]` gives O(1) access with no search at all.\n- Must track `best_idx`; when the best level empties, scan to the next non-empty level (O(gap)), or keep a **bitmap** of non-empty levels and use `__builtin_ctzll` / `clz` to jump 64 levels per instruction.\n- Memory: 1000 levels x 2 sides x 64 B = ~128 KB; fine. A wide range needs re-centring or a fallback map.\n\n**Intrusive doubly linked list per level.** Each `Order` carries `prev`/`next` pointers itself (no separate list node), so given a pointer to an order, cancel is O(1): unlink it.\n\n**Hash map from order id to order.** Cancel and modify arrive by id: `unordered_map<OrderId, Order*>` (or a flat open-addressing map, or a plain array if ids are dense/sequential) gives O(1) lookup.\n\n**Memory pool for orders.** Orders come from a pre-allocated pool (free list), not `new` per order (**in class** Lec-9 homework: allocate a huge chunk at startup, then construct objects inside it).\n\n```cpp\nstruct Order {                // 64 bytes: one cache line\n    std::uint64_t id;\n    Price price; Qty qty;\n    Order* prev; Order* next; // intrusive FIFO links\n    Level* level;             // back-pointer for O(1) qty update on cancel\n    std::uint8_t side; /* padding */\n};\n```"
+  },
+  {
+   "heading": "Complexity of each operation",
+   "body": "n = orders on a side, L = number of price levels, d = distance (in levels) from the top of book.\n\n| Structure | Add (new level) | Add (existing level) | Cancel by id | Best price | Execute at top |\n|---|---|---|---|---|---|\n| `priority_queue` + lazy delete | O(log n) | O(log n) | O(1) mark, cost paid later | O(1) after skipping stale | O(log n) |\n| `multiset` + id->iterator map | O(log n) | O(log n) | O(1) amortised | O(1) (`begin()`) | O(1) amortised |\n| `std::map<Price, Level>` + list + id map | O(log L) | O(log L) find, O(1) append | O(1) unlink (+ O(1) amortised erase of empty level by iterator) | O(1) | O(1) |\n| Sorted vector, best at back, linear search | O(d) | O(d) | O(1) unlink; O(d) to erase empty level | O(1) | O(1) |\n| Array by tick + bitmap | O(1) | O(1) | O(1) | O(1) or O(gap/64) after best empties | O(1) |\n\nBig-O is not the whole story: a \"O(log L)\" `std::map` lookup touches log2(L) nodes scattered in memory, each a potential cache miss (~5-100 ns), while an O(d) linear scan over a few contiguous 16-32 B elements costs a few ns."
+  },
+  {
+   "heading": "Cache behaviour of order books",
+   "body": "The book lives on the hot path of every market-data message, so **memory layout dominates**.\n\n- `std::map` / `std::set` / `std::list`: one heap node per entry (~48-64 B for a map node with a small value), linked by pointers. Each step is a dependent load; if the node is not in L1/L2 it is a miss. Allocation per new level costs a malloc (~20-100 ns) and fragments memory.\n- `std::vector` / arrays: contiguous, hardware prefetcher streams them, several levels per 64-B cache line, no allocation after warm-up (reserve).\n- **Hot/cold split**: keep what matching touches (price, qty, next pointer) in a compact struct; move rarely-used fields (client id, text, timestamps for reporting) elsewhere.\n- **Top of book is hot**: >90 % of updates are within a few levels of the BBO, so design for that case (best at the back of a vector, `best_idx` in an array).\n- Avoid `std::unordered_map` with chaining for the id map if it misses a lot: each lookup is bucket + node = 2 misses. Open addressing (flat hash map) or a direct array indexed by id is better.\n- Keep one book per instrument on one thread/core, so its data stays in that core's caches and needs no locks."
+  },
+  {
+   "heading": "A reference implementation (map + list + id index)",
+   "body": "A correct baseline you should be able to write in an exam:\n\n```cpp\n#include <cstdint>\n#include <functional>\n#include <list>\n#include <map>\n#include <unordered_map>\n\nusing Price = std::int64_t; using Qty = std::int64_t; using Id = std::uint64_t;\nenum class Side { Buy, Sell };\nstruct Order { Id id; Side side; Price price; Qty qty; };\n\nclass OrderBook {\n    using Fifo = std::list<Order>;\n    std::map<Price, Fifo, std::greater<Price>> bids;   // best = begin()\n    std::map<Price, Fifo>                      asks;   // best = begin()\n    struct Loc { Side side; Price price; Fifo::iterator it; };\n    std::unordered_map<Id, Loc> index;                 // id -> where it rests\n\n    template <class Book, class Crosses>\n    void match(Order& in, Book& book, Crosses crosses) {\n        while (in.qty > 0 && !book.empty() && crosses(book.begin()->first)) {\n            auto lvl = book.begin();\n            Order& r = lvl->second.front();\n            Qty q = std::min(in.qty, r.qty);\n            in.qty -= q; r.qty -= q;                   // trade q @ lvl->first\n            if (r.qty == 0) { index.erase(r.id); lvl->second.pop_front(); }\n            if (lvl->second.empty()) book.erase(lvl);\n        }\n    }\npublic:\n    void addOrder(Order o) {\n        if (o.side == Side::Buy) match(o, asks, [&](Price p) { return p <= o.price; });\n        else                     match(o, bids, [&](Price p) { return p >= o.price; });\n        if (o.qty == 0) return;\n        if (o.side == Side::Buy) { auto& f = bids[o.price]; f.push_back(o); index[o.id] = {o.side, o.price, std::prev(f.end())}; }\n        else                     { auto& f = asks[o.price]; f.push_back(o); index[o.id] = {o.side, o.price, std::prev(f.end())}; }\n    }\n    void removeOrder(Id id) {\n        auto it = index.find(id); if (it == index.end()) return;\n        auto [side, px, pos] = it->second;\n        if (side == Side::Buy) { auto l = bids.find(px); l->second.erase(pos); if (l->second.empty()) bids.erase(l); }\n        else                   { auto l = asks.find(px); l->second.erase(pos); if (l->second.empty()) asks.erase(l); }\n        index.erase(it);\n    }\n};\n```\n\n`std::list` iterators stay valid when other elements are inserted or erased, which is why storing them in the index is safe. This is correct but allocation-heavy; sessions 13-14 replace each piece with flat, pooled structures."
+  },
+  {
+   "heading": "Quick revision",
+   "body": "- Bids = willing to buy, best = highest; asks = willing to sell, best = lowest.\n- Spread = best ask - best bid; mid = average; BBO = top of book.\n- Price-time priority: better price first, then earlier arrival (FIFO) within a price.\n- Trades execute at the resting (passive) order's price.\n- An incoming order crosses if buy price >= best ask or sell price <= best bid.\n- L1 = BBO, L2 = market by price, L3 = market by order.\n- Prices are stored as integer ticks, never doubles.\n- Reduce-qty keeps priority; price change or qty increase = cancel + re-add at the back.\n- `std::map<Price, Level, std::greater<>>` for bids, `std::map<Price, Level>` for asks: `begin()` is best on both.\n- The class notes swapped those comparators: watch for it.\n- priority_queue cannot erase from the middle: lazy deletion marks cancelled ids and skips them at the top.\n- multiset can erase from the middle given an iterator (amortised O(1)).\n- Cancel by id needs a hash map id -> order location.\n- Intrusive list = O(1) unlink with no extra node allocation.\n- Array indexed by tick = O(1) everything for a bounded price range; bitmap finds the next level fast.\n- Sorted vector with best at the back + linear search beats `std::map` because most updates are near the top.\n- 32-bit nanosecond timestamps wrap in ~4.3 s: use 64-bit."
+  },
+  {
+   "heading": "Exam traps",
+   "body": "- \"Best bid is the lowest bid\": no, highest. \"Best ask is the highest ask\": no, lowest.\n- Using `std::map<Price, ...>` with default ordering for bids and then taking `begin()` gives the **worst** bid.\n- `std::priority_queue` has no erase and no iteration in order; \"just remove the cancelled order\" is not possible: that is why lazy deletion exists.\n- Stale entries in lazy deletion still cost memory; a book with many cancels (HFT: >90 % of orders are cancelled) bloats.\n- `std::vector<Order>` as the FIFO with `erase(begin())` is O(n) per fill.\n- Storing `std::vector` iterators or pointers to elements in an id index is unsafe: `push_back` can reallocate and invalidate them. `std::list`/`std::map` iterators stay valid.\n- Double prices as map keys: `100.1` computed two ways may differ in the last bit and create two levels.\n- The trade price is the resting order's price, not the aggressor's limit (Paras sold @ 100 limit but got 100.5 for the first 5).\n- A market order on an empty opposite side cannot trade; it must not rest at \"price 0\".\n- O(log n) on paper can lose to O(n) on a tiny, contiguous, near-top-of-book scan: cache misses matter more than comparisons."
+  }
+ ],
+ "keyTerms": [
+  {
+   "term": "Order book",
+   "def": "All resting limit orders for one instrument, organised into bid and ask sides by price."
+  },
+  {
+   "term": "Bid",
+   "def": "An order to buy; the best bid is the highest price."
+  },
+  {
+   "term": "Ask / offer",
+   "def": "An order to sell; the best ask is the lowest price."
+  },
+  {
+   "term": "BBO",
+   "def": "Best bid and offer: the top of book on each side."
+  },
+  {
+   "term": "Spread",
+   "def": "Best ask minus best bid."
+  },
+  {
+   "term": "Price level",
+   "def": "All resting orders at one price on one side, with their aggregate quantity."
+  },
+  {
+   "term": "Price-time priority",
+   "def": "Better price executes first; at equal price, earlier arrival executes first (FIFO)."
+  },
+  {
+   "term": "Pro-rata",
+   "def": "Matching that splits fills at a price in proportion to order size."
+  },
+  {
+   "term": "Limit order",
+   "def": "Order to trade at a given price or better; the unfilled part rests in the book."
+  },
+  {
+   "term": "Market order",
+   "def": "Order to trade immediately at the best available prices with no price limit."
+  },
+  {
+   "term": "IOC",
+   "def": "Immediate-or-cancel: fill what is possible now, cancel the rest."
+  },
+  {
+   "term": "FOK",
+   "def": "Fill-or-kill: fill entirely and immediately or cancel entirely."
+  },
+  {
+   "term": "Aggressor / passive",
+   "def": "The incoming order that crosses the spread vs the resting order it trades against; trades happen at the passive price."
+  },
+  {
+   "term": "Lazy deletion",
+   "def": "Marking a cancelled entry and discarding it only when it reaches the top of a heap."
+  },
+  {
+   "term": "Intrusive list",
+   "def": "A linked list whose prev/next pointers live inside the element itself, giving O(1) unlink with no extra allocation."
+  },
+  {
+   "term": "Market by order (L3)",
+   "def": "Feed or book that tracks every individual order id."
+  },
+  {
+   "term": "Market by price (L2)",
+   "def": "Feed or book that tracks aggregate quantity per price level."
+  },
+  {
+   "term": "Tick",
+   "def": "Minimum price increment; prices are stored as integer multiples of it."
+  },
+  {
+   "term": "Crossed book",
+   "def": "State where best bid >= best ask; a matching engine resolves it by trading."
+  }
+ ],
+ "mcqs": [
+  {
+   "q": "In an order book, the best bid is:",
+   "options": [
+    "The lowest price anyone will buy at",
+    "The highest price anyone will buy at",
+    "The lowest price anyone will sell at",
+    "The last traded price"
+   ],
+   "answer": 1,
+   "explanation": "Sellers want the highest buyer, so the top of the bid side is the highest bid price.",
+   "distractors": "The lowest sell price is the best ask; the last trade is not part of the resting book.",
+   "source": "lecture"
+  },
+  {
+   "q": "Best bid 100.0, best ask 100.5. What are the spread and mid price?",
+   "options": [
+    "Spread 0.5, mid 100.25",
+    "Spread 100.25, mid 0.5",
+    "Spread 0.25, mid 100.5",
+    "Spread 0.5, mid 100.5"
+   ],
+   "answer": 0,
+   "explanation": "Spread = ask - bid = 0.5; mid = (100 + 100.5) / 2 = 100.25.",
+   "distractors": "The other options swap or misplace the two quantities.",
+   "source": "lecture"
+  },
+  {
+   "q": "Under price-time priority, two buy orders of 10 at 100 (A arrived first, then B) and one buy of 20 at 101 (C, arrived last). A sell of 25 at 100 arrives. What is filled?",
+   "options": [
+    "A 10, B 10, C 5",
+    "C 20, B 5",
+    "A 10, B 10, and 5 rests",
+    "C 20, A 5"
+   ],
+   "answer": 3,
+   "explanation": "Price first: C at 101 is best, fills 20. Then the 100 level FIFO: A arrived before B, so A gets the remaining 5.",
+   "distractors": "Time only breaks ties within a price, and B is behind A in the queue.",
+   "source": "lecture"
+  },
+  {
+   "q": "In the class example: bids 100.5 x 5 (Kartik) and 100 x 10 (Kartik), ask 101 x 5 (Manik). Paras sends SELL 10 @ 100. Which trades occur?",
+   "options": [
+    "10 @ 100",
+    "5 @ 101 and 5 @ 100",
+    "5 @ 100.5 then 5 @ 100",
+    "Nothing; it rests at 100"
+   ],
+   "answer": 2,
+   "explanation": "A sell trades against the highest bids first, at the resting prices: 5 @ 100.5 empties that level, then 5 @ 100 against the 100 bid.",
+   "distractors": "Trades are at the passive price, not the aggressor's limit; asks are the same side as Paras, so they are irrelevant.",
+   "source": "lecture"
+  },
+  {
+   "q": "At what price does a trade execute when an incoming limit order crosses a resting one?",
+   "options": [
+    "At the incoming order's limit price",
+    "At the resting (passive) order's price",
+    "At the mid price",
+    "At the average of both limits"
+   ],
+   "answer": 1,
+   "explanation": "The resting order was there first at its price; the aggressor gets that price (possibly better than its limit).",
+   "distractors": "Limit-price, mid and average conventions are not how continuous limit order books work.",
+   "source": "lecture"
+  },
+  {
+   "q": "For bids stored in `std::map<Price, Level, std::greater<Price>> bids;`, which expression gives the best bid level?",
+   "options": [
+    "bids.begin()",
+    "bids.end()",
+    "bids.rbegin()",
+    "bids.find(0)"
+   ],
+   "answer": 0,
+   "explanation": "With std::greater the map is sorted descending, so begin() is the highest price.",
+   "distractors": "rbegin() would be the lowest bid, end() is past-the-end, find(0) looks up price 0.",
+   "source": "lecture"
+  },
+  {
+   "q": "The class notes wrote `map<PRICE, vector<Order>> bids, map<PRICE, vector<Order>, greater<>> asks`. What is wrong?",
+   "options": [
+    "Nothing; this ordering puts best prices at begin() on both sides",
+    "vector cannot be a map value",
+    "std::map cannot take a comparator",
+    "The comparators are swapped: default ordering puts the lowest bid at begin(), and greater<> puts the highest ask at begin(), which are the worst prices"
+   ],
+   "answer": 3,
+   "explanation": "Bids need descending (greater) and asks ascending (less) order for begin() to be the best price. As written you would need rbegin() on both.",
+   "distractors": "Maps accept comparators and any movable type as value; the order is the issue.",
+   "source": "lecture"
+  },
+  {
+   "q": "Why does the priority_queue design from class need lazy deletion?",
+   "options": [
+    "Because priority_queue is not thread-safe",
+    "Because heaps are not sorted",
+    "Because std::priority_queue only supports access and removal at the top, not erasing an arbitrary element",
+    "Because it stores pointers"
+   ],
+   "answer": 2,
+   "explanation": "A cancel targets an order in the middle of the heap; the adaptor has no erase, so cancelled ids are recorded and skipped when they surface.",
+   "distractors": "Partial order and thread safety are not the reason; it can store values.",
+   "source": "lecture"
+  },
+  {
+   "q": "Which container lets you erase an order from the middle of a sorted collection in amortised O(1), given an iterator to it?",
+   "options": [
+    "std::priority_queue",
+    "std::multiset",
+    "std::vector (sorted)",
+    "std::stack"
+   ],
+   "answer": 1,
+   "explanation": "Associative containers erase by iterator in amortised constant time (plus rebalancing).",
+   "distractors": "priority_queue/stack have no erase, and vector erase shifts elements: O(n).",
+   "source": "lecture"
+  },
+  {
+   "q": "Cancel messages arrive with only an order id. Which structure gives O(1) average lookup of where the order rests?",
+   "options": [
+    "A hash map from id to order pointer/iterator",
+    "A linear scan of all levels",
+    "A binary search on the bids vector",
+    "A std::map<Price, Level>"
+   ],
+   "answer": 0,
+   "explanation": "The id index maps id directly to the order's location (iterator or pointer) in its level.",
+   "distractors": "The price map is keyed by price, not id; scans and binary search by price do not find an id.",
+   "source": "lecture"
+  },
+  {
+   "q": "The class notes stored the timestamp as `uint timestampNs` (32-bit). What is the problem?",
+   "options": [
+    "Nothing, 32 bits is plenty",
+    "It makes the struct too large",
+    "Unsigned types cannot store times",
+    "It wraps after about 4.3 seconds of nanoseconds, breaking time ordering"
+   ],
+   "answer": 3,
+   "explanation": "2^32 ns = 4.29 s. Use a 64-bit timestamp or a sequence number.",
+   "distractors": "32 bits is far too small; unsigned is fine as a type; 32 bits does not make it larger.",
+   "source": "lecture"
+  },
+  {
+   "q": "Why are prices stored as integer ticks rather than double in an order book?",
+   "options": [
+    "Doubles cannot be compared",
+    "Integers use more memory",
+    "Doubles are inexact, so equal prices computed differently can become separate keys; integer compares are also exact and fast",
+    "std::map cannot use double keys"
+   ],
+   "answer": 2,
+   "explanation": "0.1 + 0.2 != 0.3 in binary floating point; levels must be keyed exactly.",
+   "distractors": "Doubles compare fine and can be map keys; integers are not bigger than doubles.",
+   "source": "lecture"
+  },
+  {
+   "q": "With an array of levels indexed by price tick (bounded range), what becomes the expensive operation?",
+   "options": [
+    "Adding an order at an existing price",
+    "Finding the next best level when the current best level empties",
+    "Updating total quantity",
+    "Finding the level for a given price"
+   ],
+   "answer": 1,
+   "explanation": "Access is O(1) by index, but after the best level empties you must find the next non-empty one: a scan (O(gap)) or a bitmap search.",
+   "distractors": "All the other operations are direct indexed accesses.",
+   "source": "lecture"
+  },
+  {
+   "q": "A trader reduces the quantity of their resting order at the same price. Under typical exchange rules:",
+   "options": [
+    "It keeps its time priority",
+    "It moves to the back of the queue",
+    "It is cancelled",
+    "It moves to the front"
+   ],
+   "answer": 0,
+   "explanation": "Reducing size does not disadvantage others, so most exchanges keep priority; increasing size or changing price loses it.",
+   "distractors": "Moving to the back is the rule for qty increase or price change.",
+   "source": "lecture"
+  },
+  {
+   "q": "Why can a sorted std::vector of levels with the best price at the **back** beat a std::map for typical market data?",
+   "options": [
+    "Vectors have O(1) sorted insert anywhere",
+    "Vectors never reallocate",
+    "std::map does not keep keys sorted",
+    "Most updates are near the top of book, so inserts/erases near the back shift few elements, and the data is contiguous and cache-friendly"
+   ],
+   "answer": 3,
+   "explanation": "Data distribution matters: near-top operations touch a few contiguous elements, while a map walks several scattered nodes.",
+   "distractors": "Inserting in the middle of a vector is O(n), maps are sorted, and vectors do reallocate unless reserved.",
+   "source": "lecture"
+  },
+  {
+   "q": "What does an L2 (market-by-price) feed give you?",
+   "options": [
+    "Only the best bid and ask",
+    "Every individual order with its id",
+    "Aggregate quantity at each of the top N price levels",
+    "Only executed trades"
+   ],
+   "answer": 2,
+   "explanation": "L2 aggregates per level; L1 is BBO only; L3 (market-by-order) has every order.",
+   "distractors": "The other options describe L1, L3 and a trades feed.",
+   "source": "lecture"
+  },
+  {
+   "q": "Which situation should never persist after the matching engine processes an order?",
+   "options": [
+    "The spread is one tick",
+    "Best bid >= best ask (a crossed book)",
+    "There are 1000 price levels",
+    "One side of the book is empty"
+   ],
+   "answer": 1,
+   "explanation": "If bid >= ask the orders are marketable against each other and the engine trades them.",
+   "distractors": "One-tick spreads, empty sides and deep books are all normal.",
+   "source": "lecture"
+  },
+  {
+   "q": "An IOC buy for 100 at 50 arrives; asks are 50 x 30 and 51 x 100. What happens?",
+   "options": [
+    "Buys 30 @ 50, the remaining 70 is cancelled",
+    "Buys 100 (30 @ 50, 70 @ 51)",
+    "Rejected entirely because it cannot fully fill",
+    "Buys 30 @ 50 and 70 rests at 50"
+   ],
+   "answer": 0,
+   "explanation": "IOC trades what it can within its limit (only the 50 level) and cancels the rest; it never rests.",
+   "distractors": "51 is above the limit; all-or-nothing is FOK; resting is what a plain limit order would do.",
+   "source": "lecture"
+  },
+  {
+   "q": "In the map + std::list design, why is it safe to store `std::list` iterators in the id index?",
+   "options": [
+    "std::list iterators are plain integers",
+    "Iterators are invalidated but the hash map refreshes them",
+    "std::list is contiguous",
+    "Inserting or erasing other elements never invalidates iterators to the remaining list elements"
+   ],
+   "answer": 3,
+   "explanation": "List nodes never move; only the erased element's iterators are invalidated.",
+   "distractors": "List iterators are node pointers, not indices; list is not contiguous; no automatic refresh exists.",
+   "source": "lecture"
+  },
+  {
+   "q": "What is the main cache-related cost of `std::map<Price, Level>` on the hot path?",
+   "options": [
+    "It stores keys twice",
+    "It uses SIMD registers",
+    "Each lookup follows several pointers to nodes scattered on the heap, each a potential cache miss",
+    "It is always in L1"
+   ],
+   "answer": 2,
+   "explanation": "Red-black tree nodes are separate heap allocations; a lookup of depth ~log2(L) is a chain of dependent loads.",
+   "distractors": "Keys are stored once, there is no SIMD involved, and nothing guarantees L1 residency.",
+   "source": "lecture"
+  },
+  {
+   "q": "An intrusive doubly linked list of orders inside a level gives which benefit?",
+   "options": [
+    "O(log n) sorted insert",
+    "O(1) removal of an order given a pointer to it, with no separate node allocation",
+    "Thread safety",
+    "Automatic memory management"
+   ],
+   "answer": 1,
+   "explanation": "The order embeds prev/next, so unlinking is pointer surgery and no list-node allocation is needed.",
+   "distractors": "Lists are not sorted structures, intrusive lists do not manage memory, and they are not thread-safe.",
+   "source": "lecture"
+  },
+  {
+   "q": "A market buy for 50 arrives and the ask side is empty. What should a typical matching engine do?",
+   "options": [
+    "Cancel/reject the unfilled market order (it has no price to rest at)",
+    "Rest it at the best bid",
+    "Rest the order at price 0",
+    "Wait until an ask arrives and then fill"
+   ],
+   "answer": 0,
+   "explanation": "Market orders have no limit price; with no liquidity they are cancelled (or rejected) rather than resting.",
+   "distractors": "Resting at an arbitrary price would create a nonsensical book; waiting turns it into a different order type.",
+   "source": "lecture"
+  }
+ ],
+ "msqs": [
+  {
+   "q": "Which statements about bids and asks are true? (select all that apply)",
+   "options": [
+    "The best bid is the highest bid price",
+    "The best ask is the lowest ask price",
+    "In a normal book, best bid > best ask",
+    "The spread is best ask minus best bid",
+    "Bids are orders to sell"
+   ],
+   "answers": [
+    0,
+    1,
+    3
+   ],
+   "explanation": "Best bid is the highest buy, best ask the lowest sell, spread = ask - bid. A normal book has bid < ask (bid > ask is crossed), and bids are buys."
+  },
+  {
+   "q": "Under price-time priority, which of these decide the execution order of resting orders? (select all that apply)",
+   "options": [
+    "Price (better price first)",
+    "Arrival time within the same price",
+    "Order size (largest first)",
+    "Trader identity",
+    "Position in the FIFO queue at the level"
+   ],
+   "answers": [
+    0,
+    1,
+    4
+   ],
+   "explanation": "Price first, then arrival time, which is the FIFO position at that level. Size-based allocation is pro-rata, and trader identity is not a criterion."
+  },
+  {
+   "q": "Which of these are true about the std::priority_queue + lazy deletion design from class? (select all that apply)",
+   "options": [
+    "Cancelling an order is just marking its id as deleted",
+    "Cancelled orders are physically removed only when they reach the top",
+    "std::priority_queue provides an erase(iterator) member",
+    "Many cancels make the heap hold many stale entries",
+    "Getting the aggregate quantity at a price level is cheap"
+   ],
+   "answers": [
+    0,
+    1,
+    3
+   ],
+   "explanation": "Lazy deletion marks ids and pops them when they surface, so stale entries accumulate under heavy cancelling. priority_queue has no erase, and it has no per-level aggregation."
+  },
+  {
+   "q": "Which of these orderings put the best price at begin()? (select all that apply)",
+   "options": [
+    "std::map<Price, Level, std::greater<Price>> for bids",
+    "std::map<Price, Level> for asks",
+    "std::map<Price, Level> for bids",
+    "std::map<Price, Level, std::greater<Price>> for asks"
+   ],
+   "answers": [
+    0,
+    1
+   ],
+   "explanation": "Bids want descending (greater) so the highest is first; asks want ascending (default less) so the lowest is first. The other two put the worst price at begin()."
+  },
+  {
+   "q": "An incoming buy limit order at 101 arrives. Which resting orders can it trade against? (select all that apply)",
+   "options": [
+    "Ask at 100.5",
+    "Ask at 101",
+    "Ask at 101.5",
+    "Bid at 100",
+    "Ask at 99"
+   ],
+   "answers": [
+    0,
+    1,
+    4
+   ],
+   "explanation": "A buy at 101 crosses any ask priced <= 101. 101.5 is above its limit, and bids are on the same side."
+  },
+  {
+   "q": "Which statements about order types are correct? (select all that apply)",
+   "options": [
+    "A market order has no limit price",
+    "An IOC order never rests in the book",
+    "A FOK order may be partially filled",
+    "A post-only order is meant to add liquidity, not take it",
+    "A limit order always trades immediately"
+   ],
+   "answers": [
+    0,
+    1,
+    3
+   ],
+   "explanation": "Market orders have no price, IOC cancels its remainder, post-only refuses to cross. FOK is all-or-nothing, and a limit order only trades if it crosses."
+  },
+  {
+   "q": "Which modifications usually cause an order to lose its time priority? (select all that apply)",
+   "options": [
+    "Changing its price",
+    "Increasing its quantity",
+    "Reducing its quantity",
+    "Cancelling and re-sending it"
+   ],
+   "answers": [
+    0,
+    1,
+    3
+   ],
+   "explanation": "Price changes, size increases and cancel/re-add all put the order at the back. Reducing quantity normally keeps priority."
+  },
+  {
+   "q": "Which are good reasons to keep a hash map from order id to order location? (select all that apply)",
+   "options": [
+    "Cancels arrive identified only by id",
+    "Modifies arrive identified only by id",
+    "It keeps the levels sorted by price",
+    "It allows O(1) average lookup instead of scanning levels"
+   ],
+   "answers": [
+    0,
+    1,
+    3
+   ],
+   "explanation": "Cancel and modify messages carry ids, so a direct id index avoids scanning. Price sorting is the job of the level structure, not the id map."
+  },
+  {
+   "q": "Which structures can erase an element from the middle in O(1) (amortised) given an iterator or pointer? (select all that apply)",
+   "options": [
+    "std::list",
+    "std::multiset",
+    "Intrusive doubly linked list",
+    "std::vector",
+    "std::priority_queue"
+   ],
+   "answers": [
+    0,
+    1,
+    2
+   ],
+   "explanation": "Node-based containers and intrusive lists unlink in constant time. vector shifts elements (O(n)) and priority_queue has no erase."
+  },
+  {
+   "q": "Which statements about an array of levels indexed by price tick are true? (select all that apply)",
+   "options": [
+    "Lookup of a level by price is O(1)",
+    "It needs a bounded or re-centred price range",
+    "It requires one heap allocation per new level",
+    "After the best level empties, the next best must be found by scanning or a bitmap",
+    "It stores levels contiguously, which is cache-friendly"
+   ],
+   "answers": [
+    0,
+    1,
+    3,
+    4
+   ],
+   "explanation": "Indexing is O(1) and contiguous, but the range must be bounded and the next best must be searched after the top empties. All levels are pre-allocated, so no per-level allocation."
+  },
+  {
+   "q": "Which are problems with the class order struct (`uint id; Side side; Price price; quantity qty; uint timestampNs;`) if used literally? (select all that apply)",
+   "options": [
+    "A 32-bit nanosecond timestamp wraps in about 4.3 seconds",
+    "A 32-bit id can overflow on a busy day (over 4.29 billion orders across instruments)",
+    "Using a double for Price would make exact level keys unreliable",
+    "Having a side field makes matching impossible"
+   ],
+   "answers": [
+    0,
+    1,
+    2
+   ],
+   "explanation": "32-bit timestamps and ids are too small for HFT volumes, and a floating-point Price would break exact keying. A side field is needed, not a problem."
+  },
+  {
+   "q": "Which are true about the cache behaviour of order-book designs? (select all that apply)",
+   "options": [
+    "std::map nodes are separate heap allocations linked by pointers",
+    "A contiguous vector of levels lets the hardware prefetcher help",
+    "A linear scan of a few contiguous levels can beat a tree lookup",
+    "Big-O complexity alone predicts real latency",
+    "Hot/cold splitting keeps matching data compact"
+   ],
+   "answers": [
+    0,
+    1,
+    2,
+    4
+   ],
+   "explanation": "Trees chase scattered nodes, vectors are prefetched, short contiguous scans are very cheap, and hot/cold splitting improves density. Big-O ignores constants and cache misses, so it does not predict latency alone."
+  },
+  {
+   "q": "In the class example (bids 100.5 x 5, 100 x 10; ask 101 x 5; then SELL 10 @ 100), which statements about the result are true? (select all that apply)",
+   "options": [
+    "The 100.5 level is removed",
+    "5 shares remain bid at 100",
+    "The ask at 101 trades",
+    "The new spread is 1 (101 - 100)",
+    "The sell rests 10 @ 100"
+   ],
+   "answers": [
+    0,
+    1,
+    3
+   ],
+   "explanation": "The sell takes 5 @ 100.5 (level removed) and 5 @ 100, leaving 5 at 100 against the untouched 101 ask, so the spread is 1. The ask is on the same side, and nothing rests because the sell was fully filled."
+  }
+ ],
+ "short": [
+  {
+   "q": "Walk through the class matching example: Kartik BUY 10 @ 100, Manik SELL 5 @ 101, Kartik BUY 5 @ 100.5, Paras SELL 10 @ 100. Give the book after each step, the trades and the final BBO.",
+   "checks": [
+    {
+     "label": "First two orders rest without trading",
+     "patterns": [
+      "rest",
+      "no (trade|cross|match)"
+     ]
+    },
+    {
+     "label": "Trade 5 at 100.5",
+     "patterns": [
+      "5\\s*@\\s*100\\.5",
+      "5 (shares )?at 100\\.5"
+     ]
+    },
+    {
+     "label": "Trade 5 at 100",
+     "patterns": [
+      "5\\s*@\\s*100\\b",
+      "5 (shares )?at 100\\b"
+     ]
+    },
+    {
+     "label": "Trades at the resting price / best bid first",
+     "patterns": [
+      "resting",
+      "passive",
+      "highest bid first",
+      "best bid first"
+     ]
+    },
+    {
+     "label": "Final BBO 100 / 101 with 5 left at 100",
+     "patterns": [
+      "100\\s*/\\s*101",
+      "bid 100.*ask 101",
+      "spread (is |of )?1"
+     ]
+    }
+   ],
+   "modelAnswer": "1. Kartik BUY 10 @ 100: no asks, so no cross; it rests. Bids `100: [K1 10]`.\n2. Manik SELL 5 @ 101: best bid 100 < 101, no trade; it rests. Asks `101: [M 5]`. BBO 100 / 101.\n3. Kartik BUY 5 @ 100.5: best ask 101 > 100.5, no trade; it rests at a new best level. Bids `100.5: [K2 5]`, `100: [K1 10]`. BBO 100.5 / 101.\n4. Paras SELL 10 @ 100: it crosses because 100 <= best bid 100.5. Matching goes highest bid first, at the resting (passive) price:\n   - 5 @ 100.5 against K2, level 100.5 is now empty and removed;\n   - next best bid 100 >= 100, so 5 @ 100 against K1, who has 5 left.\n   Paras is fully filled and nothing rests.\n\nFinal book: bids `100: [K1 5]`, asks `101: [M 5]`. BBO 100 / 101, spread 1. Paras got a better price (100.5) than his limit for half the order.",
+   "explanation": "Correct crossing logic, best-price-first matching and execution at the passive price."
+  },
+  {
+   "q": "Compare the three order-book designs discussed in class: priority_queue with lazy deletion, std::multiset, and std::map<Price, Level>. Give the cost of add, cancel and best price for each.",
+   "checks": [
+    {
+     "label": "priority_queue cannot erase / lazy deletion marks ids",
+     "patterns": [
+      "lazy",
+      "mark"
+     ]
+    },
+    {
+     "label": "multiset erase by iterator",
+     "patterns": [
+      "multiset"
+     ]
+    },
+    {
+     "label": "map of price levels",
+     "patterns": [
+      "std::map|map<"
+     ]
+    },
+    {
+     "label": "Gives log complexity",
+     "patterns": [
+      "log"
+     ]
+    },
+    {
+     "label": "Mentions the id index / hash map for cancel",
+     "patterns": [
+      "hash",
+      "unordered_map",
+      "id index",
+      "id ?->"
+     ]
+    }
+   ],
+   "modelAnswer": "**priority_queue + lazy deletion:** a max-heap of bids and a min-heap of asks ordered by (price, time). Add O(log n); best = `top()` O(1). The heap cannot erase from the middle, so cancel just marks the id (in class `deleted[id]++`; better an `unordered_set`), O(1). When a marked order reaches the top it is popped, O(log n) each. Downsides: stale entries waste memory and cache, no per-level aggregate qty, modify = cancel + add.\n\n**std::multiset<Order, (price, time) comparator>:** add O(log n); best = `begin()` O(1); cancel is a real erase, amortised O(1) given an iterator (stored in an `unordered_map<id, iterator>` hash map), O(log n) by key. One node allocation per order, pointer chasing.\n\n**std::map<Price, Level>** (bids with `std::greater`, asks with `std::less`) where each Level is a FIFO list plus total qty: add O(log L) to find the level (L = number of levels, much smaller than n) plus O(1) append; best = `begin()` O(1); cancel O(1) via the id index (hash map from id to list iterator) plus erasing the level if it becomes empty. It gives aggregated depth for free and is the standard baseline, but still allocates nodes; faster books replace it with a flat vector or tick-indexed array.",
+   "explanation": "Know each structure's weakness: no middle erase in a heap, per-order nodes in a multiset, and why levels + an id index is the practical design."
+  },
+  {
+   "q": "Find the bug(s): `std::map<int64_t, std::vector<Order>> bids; std::map<int64_t, std::vector<Order>, std::greater<>> asks;` and the best bid is read with `bids.begin()`. Also, fills pop from the front of the vector with `erase(v.begin())`.",
+   "checks": [
+    {
+     "label": "Comparators swapped; bids need greater / descending",
+     "patterns": [
+      "swap",
+      "greater.*bids",
+      "bids.*greater",
+      "descending"
+     ]
+    },
+    {
+     "label": "begin() gives the lowest bid (worst)",
+     "patterns": [
+      "lowest",
+      "worst"
+     ]
+    },
+    {
+     "label": "Front erase of a vector is O(n)",
+     "patterns": [
+      "O\\(n\\)",
+      "linear",
+      "shift"
+     ]
+    },
+    {
+     "label": "Suggests deque or list or head index",
+     "patterns": [
+      "deque",
+      "list",
+      "head index",
+      "ring"
+     ]
+    }
+   ],
+   "modelAnswer": "1. The comparators are swapped. `std::map` with the default `std::less` is ascending, so `bids.begin()` returns the **lowest** bid, the worst one, and `asks.begin()` with `std::greater` returns the highest ask, also the worst. Fix: `std::map<int64_t, Level, std::greater<>> bids;` (descending, begin = best bid) and `std::map<int64_t, Level> asks;` (ascending, begin = best ask), or use `rbegin()` consistently.\n2. FIFO pops with `v.erase(v.begin())` are O(n) because every remaining order is shifted forward. Under price-time priority fills always come from the front, so use a `std::deque`, a `std::list` / intrusive list (which also gives O(1) cancel), or a vector with a moving head index (a ring).\n3. Also, vector reallocation invalidates any pointers or iterators kept in an id index; a list or pool-allocated orders avoid that.",
+   "explanation": "Spot the ordering mistake in the class notes and the hidden O(n) FIFO cost."
+  },
+  {
+   "q": "Design a fast order book for an instrument whose price stays within 1000 ticks (the class requirement). Describe the data structures for levels, orders and the id lookup, and the complexity of add, cancel and best-price.",
+   "checks": [
+    {
+     "label": "Array indexed by price tick",
+     "patterns": [
+      "array",
+      "index(ed)? by (price|tick)"
+     ]
+    },
+    {
+     "label": "Track best index / bitmap for next level",
+     "patterns": [
+      "best_?idx",
+      "best index",
+      "bitmap",
+      "ctz|clz"
+     ]
+    },
+    {
+     "label": "Intrusive list or FIFO per level",
+     "patterns": [
+      "intrusive",
+      "FIFO",
+      "linked list"
+     ]
+    },
+    {
+     "label": "Id lookup by hash map or array",
+     "patterns": [
+      "hash",
+      "unordered_map",
+      "id.*(array|table)"
+     ]
+    },
+    {
+     "label": "Pre-allocated pool, no malloc on hot path",
+     "patterns": [
+      "pool",
+      "pre-?allocat"
+     ]
+    },
+    {
+     "label": "O(1) operations",
+     "patterns": [
+      "O\\(1\\)"
+     ]
+    }
+   ],
+   "modelAnswer": "- **Levels:** two arrays (bids, asks) of 1000 `Level` structs indexed by `(price - base) / tick`, each holding total qty and head/tail pointers of a FIFO. Finding a level is O(1), memory is contiguous (~64 KB per side at 64 B per level).\n- **Best price:** keep `best_bid_idx` / `best_ask_idx`. Adding a better price updates it in O(1). When the best level empties, find the next non-empty level using a bitmap of non-empty levels (16 x 64-bit words) and `__builtin_ctzll` / `clzll`, so at most a few instructions instead of a scan.\n- **Orders:** stored in a pre-allocated pool (free list, no malloc on the hot path), each order holding `prev`/`next` pointers: an intrusive doubly linked FIFO inside its level for price-time priority.\n- **Id lookup:** a flat open-addressing hash map (or a direct array if ids are dense) from order id to `Order*`.\n\nComplexity: add O(1) (index + append at the FIFO tail, plus matching), cancel O(1) (hash lookup + unlink + qty update), best price O(1) (and O(1) words of bitmap search after the best level empties). Prices are integer ticks; a price outside the range goes to a slow-path fallback (e.g. a `std::map`).",
+   "explanation": "A concrete, bounded-range design with O(1) operations and no hot-path allocation."
+  },
+  {
+   "q": "Explain why most order books in HFT avoid std::map on the hot path even though its operations are O(log n), and what they use instead.",
+   "checks": [
+    {
+     "label": "Node-based / pointer chasing",
+     "patterns": [
+      "node",
+      "pointer[- ]chas"
+     ]
+    },
+    {
+     "label": "Cache misses",
+     "patterns": [
+      "cache[- ]miss",
+      "cache"
+     ]
+    },
+    {
+     "label": "Allocation per level / malloc",
+     "patterns": [
+      "alloc",
+      "malloc"
+     ]
+    },
+    {
+     "label": "Most activity near top of book",
+     "patterns": [
+      "top of (the )?book",
+      "near the (top|best)",
+      "BBO"
+     ]
+    },
+    {
+     "label": "Alternative: contiguous vector or array",
+     "patterns": [
+      "vector",
+      "array"
+     ]
+    }
+   ],
+   "modelAnswer": "`std::map` is a red-black tree: each level is a separate heap node, so a lookup is a chain of dependent pointer loads (pointer chasing). With a few hundred levels that is ~8-10 node visits, each a potential cache miss (L3 ~10-20 ns, DRAM ~60-100 ns). Creating or removing a level calls malloc/free (~20-100 ns) and fragments memory. Big-O ignores these constants.\n\nMarket data is concentrated near the top of book (the BBO and a few ticks around it). So books use contiguous structures instead: a sorted `std::vector` of levels with the best price at the back (inserts near the top shift few elements, a linear scan from the back finds the level in 1-3 steps), or an array indexed by price tick for O(1) access, plus pooled orders in intrusive lists and a flat hash map for ids. These have no allocation on the hot path and are prefetcher-friendly.",
+   "explanation": "Link data structure choice to the memory hierarchy and the data distribution."
+  },
+  {
+   "q": "Write C++ for the core loop that matches an incoming SELL limit order against the bid side stored as `std::map<Price, std::deque<Order>, std::greater<Price>> bids`.",
+   "checks": [
+    {
+     "label": "Loops while qty remains and the best bid >= sell price",
+     "patterns": [
+      ">=\\s*in\\.price",
+      ">= ?(o|order|sell)\\.price",
+      "first\\s*>=\\s*"
+     ]
+    },
+    {
+     "label": "Uses begin() as best bid",
+     "patterns": [
+      "bids\\.begin\\(\\)"
+     ]
+    },
+    {
+     "label": "Takes min of quantities",
+     "patterns": [
+      "std::min",
+      "min\\("
+     ]
+    },
+    {
+     "label": "Pops filled orders from the front",
+     "patterns": [
+      "pop_front"
+     ]
+    },
+    {
+     "label": "Erases empty levels",
+     "patterns": [
+      "erase"
+     ]
+    }
+   ],
+   "modelAnswer": "```cpp\nvoid match_sell(Order& in) {                       // in.side == Sell\n    while (in.qty > 0 && !bids.empty() && bids.begin()->first >= in.price) {\n        auto lvl = bids.begin();                   // best (highest) bid level\n        Order& rest = lvl->second.front();         // earliest order at that price\n        Qty q = std::min(in.qty, rest.qty);\n        report_trade(rest.id, in.id, lvl->first, q);   // trade at the resting price\n        in.qty  -= q;\n        rest.qty -= q;\n        if (rest.qty == 0) { index.erase(rest.id); lvl->second.pop_front(); }\n        if (lvl->second.empty()) bids.erase(lvl);  // level gone, next best becomes begin()\n    }\n    if (in.qty > 0) add_resting_ask(in);           // remainder rests on the ask side\n}\n```",
+   "explanation": "Correct cross condition, FIFO within level, level clean-up and resting the remainder."
+  }
+ ]
+}
