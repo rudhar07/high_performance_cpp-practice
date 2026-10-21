@@ -1,0 +1,851 @@
+{
+ "num": 1,
+ "title": "Getting started with C++",
+ "summary": "Why C++ wins for quant and HFT work (native code with no VM or JIT, no GC, low memory overhead, direct system calls), illustrated by the class C++ vs Java volatile-counter benchmark. It then covers the basic toolkit: the compilation pipeline, main and headers, types, printf/scanf vs cout/cin, what &x and *p mean, C arrays, 2-D arrays and std::vector.",
+ "notes": [
+  {
+   "heading": "Why C++ for quant development",
+   "body": "C++ is the default language for latency-sensitive trading because the code you write is turned **ahead of time** into native machine code for one CPU and OS. Nothing sits between your program and the hardware at run time.\n\n- **No VM and no JIT.** Java and C# ship bytecode. The JVM interprets it, profiles it, and JIT-compiles the hot paths later. That causes a warm-up period, deoptimisation events and JIT threads competing for the CPU. A C++ binary runs at full speed from the first instruction.\n- **No garbage collector.** Objects die at a known point: scope exit, `delete`, or a smart-pointer reset. Nothing can pause every thread for milliseconds while a market moves. Latency is **deterministic**, and in HFT the tail (p99, p99.9) matters more than the average.\n- **Machine dependent.** `g++ -O2 -march=native` uses the exact instruction set of the box (AVX2, BMI…). The price is that the binary is tied to an architecture and OS. You recompile for ARM, and portability is a source-level property, not a binary one.\n- **Less memory overhead.** A C++ `struct Order { int64_t id; int32_t px; int32_t qty; }` is exactly 16 bytes and can live in a contiguous array. In Java every object carries a 12–16 B header, collections hold references (pointer chasing), and generics box primitives (`Integer`). Smaller data means more of it fits in the 32–48 KiB L1 cache, and an L1 hit (~1 ns) against a DRAM miss (~60–100 ns) is the whole game.\n- **Closer to system calls.** C++ calls the C library and the kernel directly: `read`, `write`, `mmap`, `epoll`, sockets, `mlock`, CPU pinning. It can also bypass the kernel entirely (kernel-bypass NICs). Nothing like JNI stands in the way.\n- **Zero-cost abstractions.** Templates, inlining and `constexpr` let you write high-level code that compiles to the same assembly as hand-written C.\n\n| | C++ | Java |\n|---|---|---|\n| Compilation | AOT to native code | bytecode, then JIT at run time |\n| Warm-up | none | needs warm-up iterations |\n| Memory reclaim | deterministic (RAII) | GC pauses |\n| Object overhead | 0 B header, exact layout | 12–16 B header, references |\n| Portability | recompile per platform | \"write once, run anywhere\" |\n| Safety | UB possible | bounds-checked, safe |"
+  },
+  {
+   "heading": "In class: the C++ vs Java order-counter benchmark",
+   "body": "**In class:** we wrote the same \"send 100 million orders\" loop in both languages (`Lec-1/cpp_orders.cpp` and `Lec-1/OrderBenchmark.java`) and timed them.\n\n```cpp\n#include <iostream>\nvolatile long counter = 0;          // volatile: every access must really happen\n\nvoid sendOrder() { counter = counter + 1; }\n\nint main() {\n    int num_of_orders = 1000'000'00; // C++14 digit separator = 100,000,000\n    for (int i = 0; i < num_of_orders; i++) sendOrder();\n    return 0;\n}\n```\n\n```bash\ng++ -O2 cpp_orders.cpp -o cpp_orders && time ./cpp_orders\njavac OrderBenchmark.java && time java OrderBenchmark\n```\n\nWhat the example teaches:\n\n- **Why `volatile`?** Without it, at `-O2` the compiler inlines `sendOrder`, sees that nothing observes `counter` inside the loop, and replaces the whole loop with one store (`counter += 100000000`) or removes it. The benchmark would then measure nothing. `volatile` forces a real load and store on every iteration, so we time 100M actual memory updates.\n- **`volatile` means different things in the two languages.** In C++, `volatile` only stops the compiler from removing or merging accesses (it exists for memory-mapped hardware registers). It gives **no atomicity and no inter-thread ordering**: use `std::atomic` for that. In Java, a `volatile` field has visibility and ordering semantics. On x86 each volatile store is followed by a full barrier (`lock addl` or `mfence`), which costs tens of cycles. A large part of the gap is therefore that fence, plus JVM start-up and JIT warm-up.\n- `counter = counter + 1` is a read-modify-write. It is **not atomic** in either language: two threads calling it would lose increments.\n- `1000'000'00` (C++) and `1000_000_00` (Java) are both just 100,000,000. The separator is cosmetic, and placing it oddly is legal.\n- Benchmark hygiene: always compile with optimisation (`-O2`). Timing a `-O0` build is meaningless, so run several times, and make sure the work cannot be optimised away."
+  },
+  {
+   "heading": "From source to binary: the compilation pipeline",
+   "body": "```bash\ng++ -E main.cpp -o main.i     # 1. preprocess: expand #include / #define (pure text)\ng++ -S main.cpp -o main.s     # 2. compile: C++ -> assembly\ng++ -c main.cpp -o main.o     # 3. assemble: assembly -> object file (machine code + symbols)\ng++ main.o -o main            # 4. link: resolve symbols, add libstdc++, produce the executable\nobjdump -d -M intel main      # disassemble the result\n```\n\n- **The preprocessor is copy-paste.** **In class** (`Lec-2/kartik.cpp`) a file containing only `int main(){ int x;` followed by `#include \"copy_bracket\"` compiles once the included file supplies the closing `}`. `#include` literally pastes the file's text, which is why header guards and `#pragma once` exist.\n- **Looking at assembly.** **In class** (`Lec-5/first.cpp`, `Lec-3/kartik.cpp`) we compiled tiny programs such as `int x = 12; x = 3;` and `int x = 3; ++x;`. At `-O0`, every statement becomes a store to the stack slot (`mov DWORD PTR [rbp-4], 12`, then `mov DWORD PTR [rbp-4], 3`). At `-O2` the values are never used, so `main` shrinks to `xor eax, eax; ret`. That is dead-store elimination. Compiler Explorer (godbolt.org) is the quickest way to see this.\n- Useful flags: `-std=c++20`, `-O0/-O2/-O3`, `-march=native`, `-g` (debug info), `-Wall -Wextra -Werror`, `-fsanitize=address,undefined` (catches memory bugs and UB at run time).\n- **Undefined behaviour (UB)** is code the standard gives no meaning to: out-of-bounds access, signed overflow, use-after-free, an uninitialised read. The optimiser assumes UB never happens, so UB can \"work\" at `-O0` and break at `-O2`."
+  },
+  {
+   "heading": "A typical program: main, headers, namespaces",
+   "body": "```cpp\n#include <iostream>   // standard header: angle brackets\n#include <vector>\n#include \"order.h\"    // your own header: quotes (searches the current dir first)\n\nint main(int argc, char* argv[]) {   // or int main()\n    std::cout << \"args: \" << argc << '\\n';\n    return 0;                        // 0 = success; may be omitted in main only\n}\n```\n\n- **`main` must return `int`.** `void main()` is not valid standard C++. GCC rejects it with \"'::main' must return 'int'\"; some old compilers (Turbo C, MSVC) accepted it, which is why you see it in old textbooks. The return value becomes the process exit status (`echo $?`). Falling off the end of `main` (and only `main`) acts as `return 0;`.\n- `#include <bits/stdc++.h>` is a **GCC-only** header that pulls in the whole standard library (the class `vector.cpp` uses it). It is fine for contests but slow to compile and not portable.\n- `using namespace std;` saves typing, but in headers it pollutes every file that includes them and can cause name clashes (`std::count`, `std::distance`…). Prefer `std::` or targeted `using std::cout;`.\n- Program start-up: the OS loader maps the executable, the C runtime (`_start`) runs static initialisers, then calls `main`. After `main` returns, static destructors run and `exit` is called."
+  },
+  {
+   "heading": "Fundamental types, sizes and literals",
+   "body": "Sizes on x86-64 Linux (LP64 data model: GCC or Clang):\n\n| Type | Size | Notes |\n|---|---|---|\n| `char` / `bool` | 1 | `char` signedness is implementation-defined (signed on x86) |\n| `short` | 2 | |\n| `int` | 4 | range about ±2.1e9 |\n| `long` | 8 | **4 on Windows** (LLP64), so use fixed-width types |\n| `long long` | 8 | |\n| `float` / `double` | 4 / 8 | IEEE-754; `double` has about 15–16 significant digits |\n| any pointer `T*` | 8 | |\n\n- Prefer `<cstdint>` fixed-width types in trading code: `int32_t`, `int64_t`, `uint64_t`. Prices are often stored as integer ticks (`int64_t price = 10025;` for 100.25), because `0.1 + 0.2 != 0.3` in floating point.\n- **Signed overflow is UB.** Unsigned arithmetic wraps modulo 2^N. `INT_MAX + 1` is UB, while `UINT_MAX + 1u == 0`.\n- Integer division truncates toward zero: `7 / 2 == 3` and `-7 / 2 == -3`.\n- `sizeof` gives a size in bytes and is a compile-time constant (`sizeof(int) == 4`).\n- `auto x = 5;` deduces `int`, `5L` is `long`, `5u` is `unsigned`, `5.0` is `double`, `5.0f` is `float`."
+  },
+  {
+   "heading": "Input and output: printf/scanf vs cout/cin",
+   "body": "```cpp\n#include <cstdio>\n#include <iostream>\n\nint x; long long big; double px; char side;\nscanf(\"%d %lld %lf %c\", &x, &big, &px, &side);   // scanf needs ADDRESSES (&x)\nprintf(\"x=%d big=%lld px=%.2f side=%c\\n\", x, big, px, side);\n\nstd::cin >> x >> px;                            // type-safe, no format string, no &\nstd::cout << \"x=\" << x << \" px=\" << px << '\\n';\n```\n\n| | `printf` / `scanf` | `cout` / `cin` |\n|---|---|---|\n| Type safety | none: a wrong specifier is UB (`%d` with a `double`) | checked by overload resolution |\n| Extensible | no | yes: overload `operator<<` for your `Order` |\n| Speed (default) | fast | slower, because it is synchronised with C stdio |\n| Speed (tuned) | fast | comparable after the two lines below |\n\nWhy the syllabus says \"printf > cout\": by default iostreams are synchronised with C `stdio` so the two can be mixed safely, and `cin` is *tied* to `cout`, so every read first flushes `cout`. Turning both off makes iostreams about as fast as stdio:\n\n```cpp\nstd::ios::sync_with_stdio(false);  // after this, don't mix printf and cout\nstd::cin.tie(nullptr);\n```\n\n- `std::endl` = `'\\n'` **plus a flush** (a `write` syscall each time). In a loop of a million lines that is a million syscalls, so use `'\\n'`.\n- `scanf` specifiers: `%d` int, `%ld` long, `%lld` long long, `%f` float, **`%lf` double**, `%c` char, `%s` C-string (no `&` for an array, because the name already decays to a pointer).\n- On the hot path of a trading system you do **no** console I/O at all. Logging goes through a lock-free queue to a background thread. C++20 `std::format` and C++23 `std::print` are the modern type-safe and fast options."
+  },
+  {
+   "heading": "Basic pointers: what &x means",
+   "body": "Every variable lives at some address in memory. A **pointer** is a variable whose value is an address.\n\n```cpp\nint x = 42;\nint* p = &x;          // &x = \"address of x\"; p now holds e.g. 0x7ffd5c3a9a1c\nstd::cout << p;       // prints the address\nstd::cout << *p;      // * = dereference: the int AT that address -> 42\n*p = 7;               // writes through the pointer: x is now 7\nint** pp = &p;        // pointer to pointer\nstd::cout << sizeof(p);   // 8 on x86-64, whatever the pointee type\nint* q = nullptr;     // points nowhere; dereferencing it is UB (usually a segfault)\n```\n\n- The **same symbols mean different things in declarations and in expressions**. In a declaration, `int* p` declares a pointer and `int& r = x` declares a reference. In an expression, `&x` takes an address and `*p` dereferences.\n- The pointer's type says how to interpret the bytes at the address and how far `p + 1` moves (`sizeof(T)` bytes).\n- `int* a, b;` declares **one pointer and one int**, because the `*` binds to the name.\n- An uninitialised pointer holds garbage. Always initialise it (to `nullptr` if there is nothing yet).\n- Addresses on the stack typically look like `0x7ffc…`, and heap addresses like `0x55…` or `0x7f…` (mmap region)."
+  },
+  {
+   "heading": "Arrays (C-style)",
+   "body": "```cpp\nint a[5] = {1, 2};           // {1,2,0,0,0}: missing elements are zero-initialised\nint b[5];                    // local: indeterminate values (reading them is UB)\nint n = sizeof(a) / sizeof(a[0]);   // 5: works only where a is still an array\na[5] = 9;                    // out of bounds: UB, no check, no exception\nstd::cout << a << ' ' << &a[0];     // same address: the name decays to &a[0]\n```\n\n- An array is **contiguous**: `a[i]` is at `base + i * sizeof(int)`. That makes indexing O(1) and very cache-friendly (16 ints = one 64 B cache line).\n- `a[i]` is defined as `*(a + i)`, which is why `i[a]` also compiles.\n- The size must be a compile-time constant. `int arr[N];` with a run-time `N` (**in class**, `Lec-7/kartik.cpp`) is a **VLA**: a GCC/Clang extension from C99, **not standard C++**. It is dangerous because a big `N` overflows the stack. Use `std::vector<int>(N)`.\n- Arrays cannot be assigned or returned (`a = b;` does not compile), and passing one to a function passes a pointer (decay, session 2).\n- Global and `static` arrays are zero-initialised and live in `.bss`, not on the stack."
+  },
+  {
+   "heading": "2-D arrays and memory layout",
+   "body": "```cpp\nint m[3][4];                 // 3 rows of 4 ints, ONE contiguous block of 48 bytes\n// m[i][j] lives at  base + (i*4 + j) * sizeof(int)   <- row-major\n\nlong sum = 0;\nfor (int i = 0; i < 3; ++i)          // GOOD: inner loop walks consecutive addresses\n    for (int j = 0; j < 4; ++j) sum += m[i][j];\n\nfor (int j = 0; j < 4; ++j)          // BAD for large matrices: stride of 4*4 bytes,\n    for (int i = 0; i < 3; ++i) sum += m[i][j];   // a new cache line on almost every access\n\nvoid print(int mat[][4], int rows);  // every dimension except the first must be given\n```\n\n- C++ is **row-major**: the last index changes fastest. On a large matrix (say 4096×4096 ints) the column-order loop can be 5–10× slower purely from cache misses and lost hardware prefetching.\n- A *flat* 1-D buffer with manual indexing, `data[i * cols + j]`, is the usual high-performance representation of a run-time-sized matrix: one allocation, contiguous, SIMD-friendly.\n- `std::vector<std::vector<int>> g(r, std::vector<int>(c));` is **not** contiguous: each row is a separate heap allocation (r+1 allocations, pointer chasing). It is convenient, but slower."
+  },
+  {
+   "heading": "std::vector basics",
+   "body": "```cpp\n#include <vector>\nstd::vector<int> v;            // empty, no allocation yet\nv.push_back(3);                // grows automatically\nv.push_back(5);\nstd::vector<int> w(5, 0);      // five zeros\nstd::vector<int> z{1, 2, 3};   // initializer list\nv.size();       // number of elements\nv.capacity();   // allocated slots (>= size)\nv[1];           // no bounds check (fast)\nv.at(10);       // bounds-checked: throws std::out_of_range\nfor (int x : v) std::cout << x << ' ';\nv.reserve(1'000'000);          // allocate once up front: no reallocation while filling\n```\n\n- A vector is three pointers on the stack (begin, end, end-of-capacity: 24 bytes) plus a **contiguous heap buffer**.\n- When `size == capacity`, `push_back` allocates a bigger buffer (libstdc++ doubles it), moves the elements and frees the old buffer. That makes it amortised O(1), but each reallocation is an O(n) latency spike and **invalidates all pointers and iterators**. In low-latency code, `reserve()` at start-up.\n- It frees its memory automatically when it goes out of scope (RAII). There is no `delete` to forget.\n- `std::vector` is the default container, and almost always the fastest one for iteration."
+  },
+  {
+   "heading": "Coding exercises in C++ (exam style)",
+   "body": "Typical small exercises from the first session: read N numbers, compute statistics, and work with arrays and matrices. A quant-flavoured example is computing the VWAP from trades:\n\n```cpp\n#include <cstdio>\n#include <vector>\nstruct Trade { double price; long long qty; };\n\nint main() {\n    int n;\n    if (scanf(\"%d\", &n) != 1) return 1;\n    std::vector<Trade> t(n);\n    for (auto& tr : t) scanf(\"%lf %lld\", &tr.price, &tr.qty);\n    double notional = 0; long long vol = 0;\n    for (const auto& tr : t) { notional += tr.price * tr.qty; vol += tr.qty; }\n    printf(\"VWAP = %.4f\\n\", vol ? notional / vol : 0.0);\n}\n```\n\nOther classics worth being able to write quickly:\n\n- Reverse an array in place with two indices: `std::swap(a[i], a[n-1-i])` for `i < n/2`.\n- Max or min with a running variable initialised from `a[0]` (not 0, because the values may be negative).\n- Matrix transpose and matrix multiply with the `i-k-j` loop order (cache-friendly).\n- A prefix-sum array, `pre[i+1] = pre[i] + a[i]`, so any range sum is answered in O(1).\n- Swap two numbers through pointers (`void swap(int* a, int* b)`): the bridge to session 2."
+  },
+  {
+   "heading": "Quick revision",
+   "body": "- C++ compiles ahead of time to native code: no VM, no JIT warm-up, no GC pauses, so latency is deterministic.\n- The binary is machine dependent: `-march=native` uses the host's instructions, and you recompile per platform.\n- Less memory overhead: no object headers and exact struct layout, so more data fits in cache.\n- In class, `volatile long counter` stopped `-O2` from deleting the 100M-iteration loop.\n- C++ `volatile` is neither atomic nor a fence. Java `volatile` is a visibility and ordering guarantee with a fence on each store.\n- Pipeline: preprocess (`-E`), compile (`-S`), assemble (`-c`), link. `#include` is a text paste.\n- `int main()` is standard and `void main()` is not. Only `main` may omit `return 0`.\n- On LP64: `int` 4, `long` 8, pointer 8, `double` 8 bytes.\n- `scanf` needs `&x`. `%lf` is for a double in scanf, and `%lld` for long long.\n- `std::endl` flushes. Use `'\\n'` in loops.\n- `sync_with_stdio(false)` plus `cin.tie(nullptr)` makes iostreams fast.\n- `&x` is the address of x, `*p` dereferences, `nullptr` is the null pointer, and pointers are 8 bytes.\n- `a[i] == *(a + i)`. Arrays are contiguous, unchecked and not assignable.\n- `sizeof(a)/sizeof(a[0])` works only on a real array, not on a pointer.\n- 2-D arrays are row-major, so loop with the last index innermost.\n- `vector<vector<int>>` is not contiguous. A flat `vector<int>(r*c)` is.\n- `v[i]` is unchecked and `v.at(i)` throws. `reserve` avoids reallocation.\n- Signed overflow is UB and unsigned wraps."
+  },
+  {
+   "heading": "Exam traps",
+   "body": "- **`void main()`**: not standard. GCC refuses it (\"must return 'int'\").\n- **`int* a, b;`**: `b` is a plain `int`, not a pointer.\n- **`sizeof` on an array parameter**: `void f(int a[10]) { sizeof(a); }` gives 8 (the pointer size), not 40.\n- **`scanf(\"%d\", x)`** without `&` is UB (it writes to a garbage address). For `char name[20]`, `scanf(\"%s\", name)` correctly has no `&`.\n- **`%f` vs `%lf`**: in `printf`, `%f` prints a double (floats are promoted). In `scanf`, a double **needs** `%lf`.\n- **`volatile` for threads**: wrong in C++. It does not make `counter++` atomic. Use `std::atomic<long>`.\n- **Benchmarking at `-O0`**, or a loop whose result is unused: the optimiser may delete the loop at `-O2`, and then you time nothing.\n- **Uninitialised locals**: `int sum; sum += x;` is UB. Globals are zero-initialised, but locals are not.\n- **`int arr[n]` with a run-time `n`**: a VLA, a compiler extension, not standard C++.\n- **`endl` in a hot loop**: one flush (syscall) per line.\n- **`long` is 4 bytes on Windows**: use `int64_t` when you need 64 bits.\n- **Column-major traversal** of a 2-D array is legal but cache-hostile.\n- **`int x = 1e10;`** overflows: the conversion is implementation-defined or UB and the value is wrong. Use `long long` or `int64_t`."
+  }
+ ],
+ "keyTerms": [
+  {
+   "term": "AOT compilation",
+   "def": "Ahead-of-time compilation to native machine code before the program runs, as C++ does, as opposed to JIT compilation at run time."
+  },
+  {
+   "term": "JIT",
+   "def": "Just-in-time compiler (e.g. the JVM's HotSpot) that compiles hot bytecode to machine code while the program runs. It needs warm-up."
+  },
+  {
+   "term": "Garbage collector",
+   "def": "A runtime component that finds and frees unreachable objects automatically, and can pause threads. C++ has none."
+  },
+  {
+   "term": "volatile (C++)",
+   "def": "Qualifier forcing every read or write of the object to be emitted. It provides no atomicity or thread ordering."
+  },
+  {
+   "term": "Undefined behaviour",
+   "def": "Code the standard gives no meaning to (out-of-bounds access, signed overflow…). The optimiser assumes it never happens."
+  },
+  {
+   "term": "Preprocessor",
+   "def": "The first translation phase: textual handling of #include, #define and #if before compilation."
+  },
+  {
+   "term": "Linker",
+   "def": "Combines object files and libraries into an executable, resolving symbol references."
+  },
+  {
+   "term": "LP64",
+   "def": "The data model of 64-bit Linux and macOS: int 32-bit, long and pointers 64-bit."
+  },
+  {
+   "term": "Address-of (&)",
+   "def": "The operator that yields the memory address of an object: &x has type T*."
+  },
+  {
+   "term": "Dereference (*)",
+   "def": "The operator that accesses the object a pointer points to."
+  },
+  {
+   "term": "nullptr",
+   "def": "The C++11 null pointer literal, of type std::nullptr_t. Prefer it to NULL or 0."
+  },
+  {
+   "term": "Row-major order",
+   "def": "Layout of multi-dimensional arrays where the last index varies fastest (C and C++)."
+  },
+  {
+   "term": "VLA",
+   "def": "Variable-length array `int a[n]` with a run-time n: a C99 and GCC extension, not standard C++."
+  },
+  {
+   "term": "std::vector",
+   "def": "A dynamic array with a contiguous heap buffer, amortised O(1) push_back, and automatic cleanup."
+  },
+  {
+   "term": "capacity",
+   "def": "The number of elements a vector can hold before it must reallocate. It is always >= size()."
+  },
+  {
+   "term": "sync_with_stdio",
+   "def": "Setting that keeps iostreams synchronised with C stdio. Turning it off speeds up cin and cout."
+  }
+ ],
+ "mcqs": [
+  {
+   "q": "Which is the MAIN reason C++ code avoids the unpredictable latency spikes seen in a default JVM application?",
+   "options": [
+    "C++ code is always multithreaded",
+    "C++ is interpreted line by line, so it never stalls",
+    "C++ has no garbage collector, so objects are freed deterministically and there are no GC pauses",
+    "C++ compilers insert fewer instructions per statement"
+   ],
+   "answer": 2,
+   "explanation": "Without a GC, memory is reclaimed at known points (RAII or delete), so no stop-the-world collection can pause the program at an arbitrary moment.",
+   "distractors": "C++ is compiled, not interpreted. Threading and instruction count are unrelated to GC pauses.",
+   "source": "lecture"
+  },
+  {
+   "q": "In the class benchmark, why is `counter` declared `volatile long` in the C++ version?\n\n    volatile long counter = 0;\n    void sendOrder() { counter = counter + 1; }",
+   "options": [
+    "To stop the optimiser from collapsing or deleting the loop, so every increment really touches memory",
+    "To make the increment atomic across threads",
+    "To place counter in a CPU register for speed",
+    "Because a long cannot be incremented otherwise"
+   ],
+   "answer": 0,
+   "explanation": "At -O2 the compiler would inline sendOrder and fold the 100M increments into one store or remove them. volatile forces each load and store to be emitted, so the benchmark measures real work.",
+   "distractors": "C++ volatile gives no atomicity, and it actually keeps the value OUT of a register.",
+   "source": "lecture"
+  },
+  {
+   "q": "Which statement about `volatile` is correct?",
+   "options": [
+    "In both C++ and Java, volatile makes `x++` atomic",
+    "In C++ volatile provides acquire/release ordering between threads",
+    "In Java, volatile has no effect on the generated machine code",
+    "In Java a volatile write has visibility and ordering semantics (a fence on x86), while in C++ volatile only prevents the compiler from eliding accesses"
+   ],
+   "answer": 3,
+   "explanation": "Java volatile gives happens-before semantics, implemented with a StoreLoad barrier after volatile stores on x86. C++ volatile is only about not optimising accesses away (for memory-mapped I/O).",
+   "distractors": "Neither language makes `x++` atomic with volatile. C++ thread ordering needs std::atomic.",
+   "source": "lecture"
+  },
+  {
+   "q": "What does `int num_of_orders = 1000'000'00;` evaluate to?",
+   "options": [
+    "It does not compile: separators must be every three digits",
+    "100000000",
+    "1000000",
+    "1000'000'00 is parsed as a character literal"
+   ],
+   "answer": 1,
+   "explanation": "C++14 digit separators (') are ignored by the compiler wherever they appear between digits, so this is 100,000,000 (fits in a 32-bit int).",
+   "distractors": "There is no grouping rule, and the quotes are separators, not a char literal.",
+   "source": "lecture"
+  },
+  {
+   "q": "GCC compiles this with `g++ -std=c++20`. What happens?\n\n    #include <iostream>\n    void main() { std::cout << \"hi\"; }",
+   "options": [
+    "It compiles and prints hi",
+    "It compiles with a warning and the exit code is random",
+    "It is a compile error: '::main' must return 'int'",
+    "It links but crashes at start-up"
+   ],
+   "answer": 2,
+   "explanation": "The standard requires main to return int. GCC treats `void main` as an error.",
+   "distractors": "Some old or non-conforming compilers accepted void main, but GCC does not.",
+   "source": "lecture"
+  },
+  {
+   "q": "Which g++ flag stops after preprocessing, so you can see what `#include` pasted in?",
+   "options": [
+    "-c",
+    "-S",
+    "-O0",
+    "-E"
+   ],
+   "answer": 3,
+   "explanation": "-E runs only the preprocessor and outputs the expanded translation unit.",
+   "distractors": "-S stops after generating assembly, -c after producing an object file, and -O0 is an optimisation level.",
+   "source": "lecture"
+  },
+  {
+   "q": "At `-O2`, what is `main` most likely compiled to?\n\n    int main() { int x = 12; x = 3; }",
+   "options": [
+    "xor eax, eax / ret",
+    "two mov instructions to the stack, then ret",
+    "a call to a runtime initialiser for x",
+    "mov eax, 3 / ret"
+   ],
+   "answer": 0,
+   "explanation": "x is never observed, so both stores are dead and removed. main just returns 0 (falling off main = return 0), which is `xor eax,eax; ret`.",
+   "distractors": "The two stack stores appear only at -O0. main returns 0, not x.",
+   "source": "lecture"
+  },
+  {
+   "q": "On x86-64 Linux with GCC, what does this print?\n\n    std::cout << sizeof(int) << sizeof(long) << sizeof(int*) << sizeof(double);",
+   "options": [
+    "4488",
+    "4888",
+    "4848",
+    "8888"
+   ],
+   "answer": 1,
+   "explanation": "LP64: int is 4, long is 8, every pointer is 8 and double is 8, so it prints 4888.",
+   "distractors": "4488 would be Windows LLP64 (long = 4). Pointers are 8 bytes on 64-bit regardless of pointee.",
+   "source": "lecture"
+  },
+  {
+   "q": "Which `scanf` call correctly reads a `double d`?",
+   "options": [
+    "scanf(\"%lf\", &d);",
+    "scanf(\"%f\", &d);",
+    "scanf(\"%lf\", d);",
+    "scanf(\"%d\", &d);"
+   ],
+   "answer": 0,
+   "explanation": "scanf needs the address of the variable and the %lf specifier for double. %f expects a float*.",
+   "distractors": "%f with a double* is UB, and passing d by value is UB because scanf writes to a garbage address.",
+   "source": "lecture"
+  },
+  {
+   "q": "A program prints 10 million lines with `std::cout << x << std::endl;` and is slow. What is the best single fix?",
+   "options": [
+    "Switch to std::cerr",
+    "Replace std::endl with '\\n' (and disable sync_with_stdio)",
+    "Use std::flush after every line",
+    "Print with std::to_string(x)"
+   ],
+   "answer": 1,
+   "explanation": "endl forces a flush (usually a write syscall) on every line. '\\n' lets the buffer fill, and unsyncing removes the stdio lock-step overhead.",
+   "distractors": "cerr is unbuffered (worse), extra flushes are worse, and to_string adds allocations.",
+   "source": "lecture"
+  },
+  {
+   "q": "What does this print?\n\n    int x = 5;\n    int* p = &x;\n    *p = *p * 2;\n    std::cout << x;",
+   "options": [
+    "5",
+    "The address of x",
+    "Compile error: cannot assign through *p",
+    "10"
+   ],
+   "answer": 3,
+   "explanation": "p points to x, so `*p = *p * 2` reads 5 and writes 10 into x.",
+   "distractors": "*p is an lvalue referring to x, so assignment is fine and x changes.",
+   "source": "lecture"
+  },
+  {
+   "q": "Given `int* a, b;`, what are the types of a and b?",
+   "options": [
+    "a is int*, b is int",
+    "both are int*",
+    "both are int",
+    "a is int, b is int*"
+   ],
+   "answer": 0,
+   "explanation": "The * belongs to the declarator, so it applies only to a. Write `int *a, *b;` or use one declaration per line.",
+   "distractors": "A common reading mistake is to treat `int*` as a type applied to the whole list.",
+   "source": "lecture"
+  },
+  {
+   "q": "What is printed?\n\n    int a[5] = {1, 2};\n    std::cout << a[3] + sizeof(a) / sizeof(a[0]);",
+   "options": [
+    "Garbage (a[3] is uninitialised)",
+    "5",
+    "7",
+    "3"
+   ],
+   "answer": 1,
+   "explanation": "With a brace initializer, missing elements are zero-initialised, so a[3] == 0. sizeof(a)/sizeof(a[0]) == 20/4 == 5, giving 0 + 5 = 5.",
+   "distractors": "Partial aggregate initialisation zeroes the rest, so it is not garbage.",
+   "source": "lecture"
+  },
+  {
+   "q": "For a large `int m[4096][4096]`, which loop is fastest for summing all elements?",
+   "options": [
+    "for j { for i { sum += m[i][j]; } }",
+    "Both take the same time because the work is identical",
+    "for i { for j { sum += m[i][j]; } }",
+    "Recursion over quadrants is always fastest"
+   ],
+   "answer": 2,
+   "explanation": "C++ arrays are row-major, so the j-inner loop touches consecutive addresses: 16 ints per 64 B cache line, and the prefetcher helps. The i-inner loop strides 16 KiB per access and misses the cache almost every time.",
+   "distractors": "The same operation count does not mean the same memory traffic. Recursive tiling helps transpose and matmul, not a simple sum.",
+   "source": "lecture"
+  },
+  {
+   "q": "How is `std::vector<std::vector<int>> g(1000, std::vector<int>(1000));` laid out in memory?",
+   "options": [
+    "One contiguous block of 1,000,000 ints",
+    "On the stack, in row-major order",
+    "As 1000 separate heap buffers plus an outer buffer of vector objects",
+    "As a linked list of rows"
+   ],
+   "answer": 2,
+   "explanation": "Each inner vector owns its own heap allocation, so rows are not adjacent. That makes 1001 allocations and an extra indirection per row. A flat vector<int>(1000*1000) is contiguous.",
+   "distractors": "Only built-in 2-D arrays (or a flat buffer) are a single block. A vector's data is never on the stack.",
+   "source": "lecture"
+  },
+  {
+   "q": "Which statement about `int arr[N];` where N was read with `cin >> N` is correct?",
+   "options": [
+    "It is standard C++17",
+    "It allocates arr on the heap",
+    "It is a compile error in GCC",
+    "It is a VLA: a GCC/Clang extension, not standard C++, and a large N can overflow the stack"
+   ],
+   "answer": 3,
+   "explanation": "Standard C++ requires array bounds to be constant expressions. GCC accepts VLAs as an extension and places them on the stack.",
+   "distractors": "GCC accepts it (with -pedantic it warns). It is not on the heap.",
+   "source": "lecture"
+  },
+  {
+   "q": "`std::vector<int> v; v.reserve(100); v[50] = 1;`: what is true?",
+   "options": [
+    "v.size() is now 51",
+    "It is UB: reserve changes capacity, not size, so element 50 does not exist",
+    "It throws std::out_of_range",
+    "It is fine because reserve value-initialises 100 ints"
+   ],
+   "answer": 1,
+   "explanation": "reserve only allocates storage. size() is still 0, and operator[] is unchecked, so writing v[50] is UB. Use resize(100) or push_back.",
+   "distractors": "operator[] never throws (at() does), and reserve does not construct elements.",
+   "source": "lecture"
+  },
+  {
+   "q": "What does this print?\n\n    int a[3] = {10, 20, 30};\n    std::cout << 2[a];",
+   "options": [
+    "30",
+    "Compile error",
+    "20",
+    "An address"
+   ],
+   "answer": 0,
+   "explanation": "`a[i]` is defined as `*(a + i)`, and addition commutes, so `2[a]` is `*(2 + a)`, which is a[2] == 30.",
+   "distractors": "It is legal (if obfuscated) C++. Indexing is 0-based, so 2 is the third element.",
+   "source": "lecture"
+  },
+  {
+   "q": "What does this print?\n\n    std::cout << 7 / 2 << ' ' << -7 / 2 << ' ' << 7 % -3;",
+   "options": [
+    "3 -4 1",
+    "4 -3 1",
+    "3 -3 1",
+    "3 -3 -1"
+   ],
+   "answer": 2,
+   "explanation": "Integer division truncates toward zero (since C++11), so 7/2 = 3 and -7/2 = -3. The sign of % follows the dividend, so 7 % -3 = 1.",
+   "distractors": "-4 would be floor division (Python). A negative remainder needs a negative dividend.",
+   "source": "lecture"
+  },
+  {
+   "q": "What is the cost of `libstdc++`'s `std::vector::push_back` when the vector is full?",
+   "options": [
+    "It adds one slot, so every push_back is O(n)",
+    "It throws std::length_error",
+    "It allocates a buffer a constant factor larger (2x in libstdc++), moves the elements and frees the old one: amortised O(1), but an O(n) spike",
+    "It links a new chunk without moving anything, like a deque"
+   ],
+   "answer": 2,
+   "explanation": "Geometric growth makes the total copying cost O(n) over n pushes (amortised O(1)), but the one push that reallocates is O(n) and invalidates iterators.",
+   "distractors": "Growing by a constant +1 would make the total O(n²). Only deque grows in chunks without relocating.",
+   "source": "lecture"
+  },
+  {
+   "q": "At -O2, GCC may compile this function to `mov eax, 1; ret`. Why?\n\n    bool f(int x) { return x + 1 > x; }",
+   "options": [
+    "Signed overflow is UB, so the compiler may assume x + 1 never overflows and the comparison is always true",
+    "Because int arithmetic is done in 64 bits",
+    "It is a compiler bug",
+    "Because INT_MAX + 1 wraps to INT_MIN, which is greater than x"
+   ],
+   "answer": 0,
+   "explanation": "The optimiser assumes UB never happens. Without overflow, x + 1 > x is always true, so the check folds to a constant.",
+   "distractors": "Wrapping is the unsigned rule. For signed ints it is UB, which is exactly what licenses the fold.",
+   "source": "lecture"
+  },
+  {
+   "q": "The build fails with `undefined reference to 'priceOrder(int)'`. Which stage reported it?",
+   "options": [
+    "The preprocessor",
+    "The compiler front end",
+    "The assembler",
+    "The linker"
+   ],
+   "answer": 3,
+   "explanation": "The declaration was visible, so compilation succeeded. The linker could not find the definition in any object file or library.",
+   "distractors": "A missing declaration would be a compile error ('was not declared in this scope'), not an undefined reference.",
+   "source": "lecture"
+  },
+  {
+   "q": "What happens with `printf(\"%d\\n\", 3.5);` on x86-64 Linux?",
+   "options": [
+    "It prints 3",
+    "It prints 4",
+    "It is UB: the specifier does not match the argument type, and in practice it prints garbage (the double travels in xmm0, while %d reads a general-purpose register)",
+    "It is always a compile error"
+   ],
+   "answer": 2,
+   "explanation": "printf is variadic and not type-checked by the language. GCC only warns with -Wformat. A mismatched specifier is UB.",
+   "distractors": "There is no implicit conversion to int for variadic arguments, and it compiles (with a warning).",
+   "source": "lecture"
+  },
+  {
+   "q": "How does a C++ program on Linux typically receive a market-data UDP packet through the kernel?",
+   "options": [
+    "Through a VM bridge such as JNI",
+    "The compiler translates sockets into JIT stubs",
+    "By polling a GC-managed buffer",
+    "By calling a thin libc wrapper such as recv()/recvmsg(), which executes the syscall instruction directly"
+   ],
+   "answer": 3,
+   "explanation": "C++ sits right on top of libc and the kernel ABI, so a socket read is a function call plus a syscall. Kernel-bypass libraries go further and read the NIC from user space.",
+   "distractors": "JNI is the Java-to-native bridge, which C++ does not need. There is no GC or JIT in C++.",
+   "source": "lecture"
+  }
+ ],
+ "msqs": [
+  {
+   "q": "Which of the following are reasons C++ typically achieves lower and more predictable latency than Java? (select all that apply)",
+   "options": [
+    "No JIT warm-up: the code is native from the first instruction",
+    "No garbage-collector pauses",
+    "C++ automatically parallelises loops",
+    "Objects have no header and an exact layout, so more data fits in cache",
+    "C++ bounds-checks every array access"
+   ],
+   "answers": [
+    0,
+    1,
+    3
+   ],
+   "explanation": "AOT native code, deterministic destruction and compact layout are the three syllabus arguments. C++ does not auto-parallelise loops, and it does NOT bounds-check arrays (that is a safety cost, not a speed win)."
+  },
+  {
+   "q": "Which statements about `volatile` in C++ are true? (select all that apply)",
+   "options": [
+    "It prevents the compiler from removing or merging accesses to the object",
+    "It makes `counter++` atomic",
+    "It is intended for memory-mapped hardware registers (and similar)",
+    "It provides acquire/release ordering between threads",
+    "A volatile object cannot be kept in a register across accesses: every access goes to memory"
+   ],
+   "answers": [
+    0,
+    2,
+    4
+   ],
+   "explanation": "volatile only forces each access to really happen in memory, which is why the class benchmark used it. It gives no atomicity and no inter-thread ordering: that is std::atomic's job."
+  },
+  {
+   "q": "Which are valid signatures of `main` in standard C++? (select all that apply)",
+   "options": [
+    "int main()",
+    "void main()",
+    "int main(int argc, char* argv[])",
+    "int main(int argc, char** argv)",
+    "char main()"
+   ],
+   "answers": [
+    0,
+    2,
+    3
+   ],
+   "explanation": "main must return int. `char* argv[]` and `char** argv` are the same parameter type. void main and char main are ill-formed (GCC rejects void main)."
+  },
+  {
+   "q": "Which of the following have undefined behaviour? (select all that apply)",
+   "options": [
+    "int x; std::cout << x;  (x is a local)",
+    "unsigned u = UINT_MAX; u++;",
+    "int a[4]; a[3] = 1;",
+    "int i = INT_MAX; i++;",
+    "int* p = nullptr; if (p) *p = 1;"
+   ],
+   "answers": [
+    0,
+    3
+   ],
+   "explanation": "Reading an uninitialised local and signed overflow are UB. a[3] is the last valid element of a[4], unsigned overflow wraps to 0 (well defined), and the null check means the dereference never runs."
+  },
+  {
+   "q": "Which `scanf` calls are correct? (select all that apply)",
+   "options": [
+    "int x;    scanf(\"%d\", &x);",
+    "double d; scanf(\"%lf\", &d);",
+    "char name[32]; scanf(\"%31s\", name);",
+    "int x;    scanf(\"%d\", x);",
+    "double d; scanf(\"%f\", &d);"
+   ],
+   "answers": [
+    0,
+    1,
+    2
+   ],
+   "explanation": "scanf needs addresses with matching specifiers. An array name already decays to a pointer, so no & is needed, and the width 31 prevents overflow. Passing x by value, or %f (float*) with a double*, is UB."
+  },
+  {
+   "q": "Which statements about `std::endl` are true? (select all that apply)",
+   "options": [
+    "It inserts a newline",
+    "It flushes the stream",
+    "It costs the same as '\\n'",
+    "Printing many lines with it can cost one write syscall per line",
+    "It is required for buffered output to appear before main returns"
+   ],
+   "answers": [
+    0,
+    1,
+    3
+   ],
+   "explanation": "endl = '\\n' + flush, so in a loop it forces a write per line. It is not needed at exit: the streams are flushed when the program terminates normally."
+  },
+  {
+   "q": "After `int x = 5; int* p = &x;`, which expressions evaluate to the int value 5? (select all that apply)",
+   "options": [
+    "*p",
+    "x",
+    "p",
+    "*&x",
+    "&*p"
+   ],
+   "answers": [
+    0,
+    1,
+    3
+   ],
+   "explanation": "*p reads x, and *&x is x. p is an address, and &*p is also the address (equal to p), not the value."
+  },
+  {
+   "q": "For `int m[3][4];`, which statements are true? (select all that apply)",
+   "options": [
+    "sizeof(m) == 48",
+    "m[1][0] is stored immediately after m[0][3]",
+    "m is an array of 3 pointers to separately allocated rows",
+    "A function parameter for it must state the column count, e.g. int m[][4]",
+    "The address of m[i][j] is base + (j*3 + i)*sizeof(int)"
+   ],
+   "answers": [
+    0,
+    1,
+    3
+   ],
+   "explanation": "A built-in 2-D array is one contiguous row-major block of 12 ints = 48 bytes, so row 1 follows row 0. There are no row pointers, and the correct formula is base + (i*4 + j)*sizeof(int)."
+  },
+  {
+   "q": "Which statements about `std::vector<int> v;` are true? (select all that apply)",
+   "options": [
+    "v.size() <= v.capacity() always",
+    "v[i] is bounds-checked and throws on a bad index",
+    "v.at(i) throws std::out_of_range for a bad index",
+    "push_back may invalidate all iterators and pointers into v",
+    "Elements are stored contiguously"
+   ],
+   "answers": [
+    0,
+    2,
+    3,
+    4
+   ],
+   "explanation": "operator[] is unchecked (UB on a bad index), while at() checks. Reallocation on push_back moves the buffer and invalidates everything, and storage is contiguous, so &v[0] works with C APIs."
+  },
+  {
+   "q": "Which pairings of g++ flag and output are correct? (select all that apply)",
+   "options": [
+    "-E produces preprocessed source",
+    "-S produces a stripped executable",
+    "-c produces a linked executable",
+    "-O2 runs only the linker",
+    "-c produces an object (.o) file"
+   ],
+   "answers": [
+    0,
+    4
+   ],
+   "explanation": "-E stops after preprocessing and -c after assembling to an object file. -S produces assembly (.s), not an executable, -c does not link, and -O2 is an optimisation level."
+  },
+  {
+   "q": "On x86-64 Linux with GCC, which are true? (select all that apply)",
+   "options": [
+    "sizeof(long) == 8",
+    "sizeof(char*) == sizeof(double*)",
+    "sizeof(int) == 8",
+    "plain char is signed",
+    "sizeof(long) == sizeof(long long)"
+   ],
+   "answers": [
+    0,
+    1,
+    3,
+    4
+   ],
+   "explanation": "LP64: int is 4 bytes and long, long long and all pointers are 8. On x86 Linux plain char is signed (it is unsigned on ARM Linux)."
+  },
+  {
+   "q": "Which practices make a micro-benchmark result misleading? (select all that apply)",
+   "options": [
+    "Timing a -O0 build",
+    "Leaving the result unused, so the optimiser deletes the loop",
+    "Running it several times and reporting the median",
+    "Timing one short run that includes JVM start-up and JIT warm-up",
+    "Compiling with -O2 and keeping the work observable (volatile or DoNotOptimize)"
+   ],
+   "answers": [
+    0,
+    1,
+    3
+   ],
+   "explanation": "-O0 code is not what you ship, dead loops are removed at -O2, and single runs that include warm-up measure start-up. Repeating runs and keeping the work observable are good practice."
+  },
+  {
+   "q": "Which of these are standard C++ (no compiler extensions needed)? (select all that apply)",
+   "options": [
+    "std::vector<int> a(n);  (n read at run time)",
+    "int a[n];  (n read at run time)",
+    "#include <bits/stdc++.h>",
+    "std::array<int, 5> a{};",
+    "int a[5] = {};"
+   ],
+   "answers": [
+    0,
+    3,
+    4
+   ],
+   "explanation": "The run-time-sized array is a VLA extension, and bits/stdc++.h is a libstdc++ internal header. vector, std::array and empty-brace zero-initialisation are all standard."
+  }
+ ],
+ "short": [
+  {
+   "q": "Give three concrete reasons why C++ is preferred over Java for low-latency trading systems, and one cost of choosing C++.",
+   "checks": [
+    {
+     "label": "Mentions no VM / no JIT / native code",
+     "patterns": [
+      "no (vm|virtual machine|jit)",
+      "native",
+      "ahead[- ]of[- ]time|\\baot\\b"
+     ]
+    },
+    {
+     "label": "Mentions no garbage collection / GC pauses",
+     "patterns": [
+      "garbage|\\bgc\\b"
+     ]
+    },
+    {
+     "label": "Mentions memory overhead / layout / cache",
+     "patterns": [
+      "memory overhead|object header|layout|cache"
+     ]
+    },
+    {
+     "label": "Mentions system calls / hardware access",
+     "patterns": [
+      "system call|syscall|kernel|hardware"
+     ]
+    },
+    {
+     "label": "Gives a cost (UB / memory safety / portability / complexity)",
+     "patterns": [
+      "undefined behaviou?r|\\bub\\b|memory safety|unsafe|portab|recompile|complex"
+     ]
+    }
+   ],
+   "modelAnswer": "1. **Native code, no VM and no JIT.** C++ compiles ahead of time to machine code for the exact CPU (`-march=native`), so there is no interpreter, no JIT warm-up and no deoptimisation.\n2. **No garbage collector.** Objects are freed deterministically (RAII), so there are no GC pauses and the tail latency is predictable.\n3. **Low memory overhead and control of layout.** There are no object headers or boxing, and structs are laid out exactly, so contiguous arrays fit in cache. An L1 hit is ~1 ns against ~80 ns for DRAM.\n4. **Close to system calls and hardware.** C++ calls `mmap`, `epoll`, sockets and CPU pinning directly, and can bypass the kernel.\n\nCost: no memory safety. Out-of-bounds access, use-after-free and similar bugs are undefined behaviour, and the binary is machine dependent, so you recompile per platform. The language is also more complex.",
+   "explanation": "The examiner wants the VM/JIT, GC and memory-overhead arguments from the syllabus, plus an honest trade-off."
+  },
+  {
+   "q": "In class, the C++ order counter loop used `volatile long counter`. Explain what would happen at -O2 without `volatile`, and why `volatile` is still NOT enough if two threads called sendOrder().",
+   "checks": [
+    {
+     "label": "Says the compiler would optimise away / fold the loop",
+     "patterns": [
+      "optimi[sz]e[sd]? (it )?away|fold|remove|delete|eliminat|single store|collapse"
+     ]
+    },
+    {
+     "label": "Says volatile forces every load/store to memory",
+     "patterns": [
+      "every (load|store|access|read|write)|each (load|store|access|read|write)|forces"
+     ]
+    },
+    {
+     "label": "Says volatile is not atomic",
+     "patterns": [
+      "not atomic|non-?atomic|no atomicity|isn.t atomic"
+     ]
+    },
+    {
+     "label": "Mentions lost updates / data race",
+     "patterns": [
+      "lost|data race|race"
+     ]
+    },
+    {
+     "label": "Suggests std::atomic (fetch_add) or a mutex",
+     "patterns": [
+      "std::atomic|atomic<|fetch_add|mutex"
+     ]
+    }
+   ],
+   "modelAnswer": "Without `volatile`, the compiler inlines `sendOrder()` and sees that `counter` is not observed inside the loop. It folds the 100M increments into a single store (`counter += 100000000`) or removes the loop entirely, so the benchmark measures nothing. `volatile` forces every load and store of `counter` to be emitted, so each iteration really reads and writes memory.\n\n`volatile` is still not atomic. `counter = counter + 1` is a separate load, add and store, so two threads can both read the same value and one increment is lost: a data race, which is UB in C++. `volatile` also provides no inter-thread ordering. The fix is `std::atomic<long> counter;` with `counter.fetch_add(1, std::memory_order_relaxed);` (a `lock xadd` on x86), or a mutex.",
+   "explanation": "The point is that the two meanings differ: volatile is a compiler-optimisation barrier, not a concurrency tool."
+  },
+  {
+   "q": "Predict the output and explain:\n\n    #include <iostream>\n    void f(int a[10]) { std::cout << sizeof(a) << ' '; }\n    int main() {\n        int a[10];\n        std::cout << sizeof(a) << ' ';\n        f(a);\n    }",
+   "checks": [
+    {
+     "label": "Says it prints 40 then 8",
+     "patterns": [
+      "40\\s*(then|,|and)?\\s*8|40 8"
+     ]
+    },
+    {
+     "label": "Explains the parameter is really a pointer",
+     "patterns": [
+      "pointer"
+     ]
+    },
+    {
+     "label": "Uses the word decay (or adjusted)",
+     "patterns": [
+      "deca|adjust"
+     ]
+    },
+    {
+     "label": "Mentions pointer size 8 bytes on 64-bit",
+     "patterns": [
+      "8 bytes|64-bit|x86-64"
+     ]
+    }
+   ],
+   "modelAnswer": "It prints `40 8`.\n\nInside `main`, `a` is a real array of 10 ints, so `sizeof(a) == 10 * 4 == 40`. A function parameter declared as `int a[10]` is **adjusted** to `int* a`: the array decays to a pointer to its first element, and the `10` is ignored. Inside `f`, `sizeof(a)` is the size of a pointer, which is 8 bytes on x86-64. To keep the size, pass it explicitly (`f(int* a, size_t n)`), use `std::array<int,10>&`, `std::span<int>`, or a reference to the array: `void f(int (&a)[10])`.",
+   "explanation": "This tests array decay and the fact that sizeof is a compile-time operator on the static type."
+  },
+  {
+   "q": "Write a fast C++ program that reads N integers from stdin and prints their sum. State the two I/O tweaks you use and why they help.",
+   "checks": [
+    {
+     "label": "Uses sync_with_stdio(false)",
+     "patterns": [
+      "sync_with_stdio\\(\\s*false\\s*\\)"
+     ]
+    },
+    {
+     "label": "Unties cin from cout",
+     "patterns": [
+      "cin\\.tie\\(\\s*(nullptr|0|NULL)\\s*\\)"
+     ]
+    },
+    {
+     "label": "Uses a 64-bit accumulator",
+     "patterns": [
+      "long long|int64_t"
+     ]
+    },
+    {
+     "label": "Avoids endl / explains flushing",
+     "patterns": [
+      "endl|flush"
+     ]
+    }
+   ],
+   "modelAnswer": "```cpp\n#include <iostream>\n#include <cstdint>\nint main() {\n    std::ios::sync_with_stdio(false);  // stop syncing iostreams with C stdio\n    std::cin.tie(nullptr);             // don't flush cout before every cin read\n    int n; std::cin >> n;\n    long long sum = 0;                 // int64_t: the sum of many ints can overflow 32 bits\n    for (int i = 0, x; i < n; ++i) { std::cin >> x; sum += x; }\n    std::cout << sum << '\\n';          // '\\n', not std::endl (which forces a flush)\n}\n```\n\n`sync_with_stdio(false)` lets `cin` and `cout` use their own buffers instead of going through C stdio on each operation. After it you must not mix `printf` and `cout`. `cin.tie(nullptr)` removes the automatic flush of `cout` before every input operation. Using `'\\n'` instead of `std::endl` avoids a flush (a write syscall) per line.",
+   "explanation": "The examiner expects both standard tweaks, an overflow-safe accumulator, and no per-line flush."
+  },
+  {
+   "q": "Explain row-major layout for `int m[R][C]` and why the loop order of a nested traversal affects performance. Give the address formula.",
+   "checks": [
+    {
+     "label": "Says last index varies fastest / rows contiguous",
+     "patterns": [
+      "row-major|last index|rows? (are |is )?(stored )?contiguous|consecutive"
+     ]
+    },
+    {
+     "label": "Gives address formula with i*C + j",
+     "patterns": [
+      "i\\s*\\*\\s*C\\s*\\+\\s*j"
+     ]
+    },
+    {
+     "label": "Mentions cache lines / cache misses",
+     "patterns": [
+      "cache"
+     ]
+    },
+    {
+     "label": "Mentions stride / prefetch / spatial locality",
+     "patterns": [
+      "stride|prefetch|spatial|locality"
+     ]
+    }
+   ],
+   "modelAnswer": "C++ stores `m[R][C]` as one contiguous block in **row-major** order: the last index varies fastest, so the elements of a row are consecutive. The address of `m[i][j]` is `base + (i*C + j) * sizeof(int)`.\n\nWith `j` in the inner loop, consecutive iterations touch consecutive addresses. One 64-byte cache line serves 16 ints, the hardware prefetcher streams the next lines, and you get good spatial locality. With `i` in the inner loop the stride is `C*4` bytes, so almost every access touches a new cache line and possibly a new 4 KiB page (more TLB misses too). For a large matrix that is several times slower, even though the arithmetic is identical.",
+   "explanation": "The examiner wants the layout, the formula and the cache argument (lines, stride, prefetching)."
+  },
+  {
+   "q": "Find the bugs in this snippet and fix them:\n\n    int main() {\n        int n, sum;\n        scanf(\"%d\", n);\n        int a[n];\n        for (int i = 0; i <= n; i++) { scanf(\"%d\", &a[i]); sum += a[i]; }\n        printf(\"%d\", sum);\n    }",
+   "checks": [
+    {
+     "label": "scanf needs &n",
+     "patterns": [
+      "&n"
+     ]
+    },
+    {
+     "label": "sum uninitialised",
+     "patterns": [
+      "uninitiali[sz]ed|sum\\s*=\\s*0|initiali[sz]e sum"
+     ]
+    },
+    {
+     "label": "Off-by-one i <= n",
+     "patterns": [
+      "off[- ]by[- ]one|i\\s*<\\s*n|<= ?n"
+     ]
+    },
+    {
+     "label": "VLA is non-standard → use vector",
+     "patterns": [
+      "\\bvla\\b|variable[- ]length|std::vector|vector<int>"
+     ]
+    }
+   ],
+   "modelAnswer": "1. `scanf(\"%d\", n)` passes the value of `n` instead of its address. scanf writes to a garbage address, which is UB. Fix: `scanf(\"%d\", &n)`.\n2. `sum` is uninitialised, and reading it is UB. Fix: `int sum = 0;`, or better `long long sum = 0;` to avoid overflow.\n3. `i <= n` is an off-by-one that reads and writes `a[n]`, one past the end (UB). Fix: `i < n`.\n4. `int a[n]` with a run-time `n` is a VLA, a GCC extension and not standard C++, and a large `n` overflows the stack. Fix: `std::vector<int> a(n);`.\n\n```cpp\nint n; if (scanf(\"%d\", &n) != 1) return 1;\nstd::vector<int> a(n); long long sum = 0;\nfor (int i = 0; i < n; i++) { scanf(\"%d\", &a[i]); sum += a[i]; }\nprintf(\"%lld\\n\", sum);\n```",
+   "explanation": "A classic find-the-bug question: each of the four issues is a separate mark."
+  }
+ ]
+}
