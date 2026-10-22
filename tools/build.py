@@ -167,12 +167,32 @@ CODING_BODY = """  <div class="crumbs"><a href="../index.html">All sessions</a> 
   <nav class="pager"><a class="btn" href="../index.html">← All sessions</a></nav>
 """
 
+PYQ_BODY = """  <div class="crumbs"><a href="../index.html">All sessions</a> / Previous year paper</div>
+  <h1>Previous year paper: End Term (2027 batch)</h1>
+  <p class="sub" id="pyq-format"></p>
+  <div class="score-line"><span id="score"></span><button class="btn" id="reset" type="button">Reset this paper</button></div>
+  <nav class="section-nav" aria-label="Sections">
+    <a class="btn" href="#sec-pyq-mcq">Section 1: 25 MCQs</a>
+    <a class="btn" href="#sec-pyq-coding">Section 2: Coding (any 2)</a>
+    <a class="btn" href="#sec-pyq-diagram">Section 3: Diagram</a>
+  </nav>
+  <h2 id="sec-pyq-mcq">Section 1: MCQs</h2>
+  <p class="sub">The official answers from the paper. Two questions are select-all (MSQ): press Submit after choosing.</p>
+  <div id="pyq-mcqs"></div>
+  <h2 id="sec-pyq-coding">Section 2: Coding (attempt any 2)</h2>
+  <p class="sub">Questions exactly as in the paper, each with a full solution that was compiled and tested with sanitizers, plus an explanation of what the examiner checks. Try it yourself first, then open the solution.</p>
+  <div id="pyq-coding"></div>
+  <h2 id="sec-pyq-diagram">Section 3: Diagram</h2>
+  <div id="pyq-diagram"></div>
+  <nav class="pager"><a class="btn" href="../index.html">← All sessions</a></nav>
+"""
+
 INDEX_BODY = """  <h1>High Performance C++: End-term Revision</h1>
   <p class="sub">14 sessions, each with one-shot notes, key terms, MCQs, multi-select questions (MSQs) and written questions, plus exam-style C++ coding problems with tested solutions. The exam has MCQs, MSQs and coding questions. Progress is saved in this browser.</p>
   <div class="summary" id="summary"></div>
   <h2>Sessions</h2>
   <div class="grid" id="grid"></div>
-  <h2>Coding practice</h2>
+  <h2>Previous year paper &amp; coding practice</h2>
   <div class="grid" id="quiz-grid"></div>
   <p class="sub" style="margin-top:10px">Jump to: <a href="coding/index.html#sec-problems">coding problems</a> · <a href="coding/index.html#sec-leetcode">LeetCode links</a> · <a href="coding/index.html#sec-other">GfG / HackerRank / Codeforces links</a></p>
   <p style="margin-top:20px"><button class="btn" id="reset-all" type="button">Reset all progress</button></p>
@@ -183,6 +203,22 @@ def main():
     problems = []
     lectures = load_lectures(problems)
     coding = load_coding(problems)
+    pyq = None
+    pyq_path = os.path.join(ROOT, "data", "pyq", "pyq.json")
+    if os.path.exists(pyq_path):
+        raw = open(pyq_path, encoding="utf-8").read()
+        if BANNED.search(raw):
+            problems.append("pyq.json: contains a banned word")
+        pyq = json.loads(raw)
+        titles = {l["num"]: l["title"] for l in lectures}
+        for q in pyq["mcqs"] + pyq["coding"] + [pyq["diagram"]]:
+            q["id"] = f"PYQ-{q['n']}"
+            sn = q.get("session")
+            q["ref"] = f'<a href="../lectures/lecture-{sn:02d}.html">Session {sn}: {html.escape(titles.get(sn, ""))}</a>' if sn else ""
+            if q.get("type") == "mcq" and not 0 <= q["answer"] < len(q["options"]):
+                problems.append(f"PYQ {q['n']}: bad answer")
+            if q.get("type") == "msq" and (len(q["answers"]) < 2 or not all(0 <= a < len(q["options"]) for a in q["answers"])):
+                problems.append(f"PYQ {q['n']}: bad MSQ answers")
     if len(lectures) != 14:
         problems.append(f"expected 14 sessions, found {len(lectures)}")
     if problems:
@@ -207,6 +243,7 @@ def main():
         "quizzes": [],
         "coding": ({"file": "coding/index.html", "ids": ["C-" + p["id"] for p in coding["problems"]],
                     "leetcode": len(coding["leetcode"]), "other": len(coding["otherPlatforms"])} if coding else None),
+        "pyq": ({"file": "pyq/index.html", "ids": [q["id"] for q in pyq["mcqs"]]} if pyq else None),
     }
     write_js(os.path.join(ROOT, "data", "site.js"), "SITE", site)
     v = {"v_css": version(os.path.join(ROOT, "assets", "style.css")), "v_js": version(os.path.join(ROOT, "assets", "app.js")),
@@ -230,6 +267,14 @@ def main():
         with open(os.path.join(ROOT, "coding", "index.html"), "w", encoding="utf-8") as f:
             f.write(PAGE.format(title="Coding practice", desc="Low-latency C++ coding problems with tested solutions, plus LeetCode and other links.",
                                 up="../", page="coding", body=CODING_BODY, scripts=scripts, **v))
+    if pyq:
+        os.makedirs(os.path.join(ROOT, "pyq"), exist_ok=True)
+        data = os.path.join(ROOT, "data", "pyq.js")
+        write_js(data, "PAGE", pyq)
+        scripts = f'<script src="../data/site.js?v={v["v_site"]}"></script>\n<script src="../data/pyq.js?v={version(data)}"></script>'
+        with open(os.path.join(ROOT, "pyq", "index.html"), "w", encoding="utf-8") as f:
+            f.write(PAGE.format(title="Previous year paper", desc="End Term 2027 paper: 25 MCQs with official answers, 4 coding questions, 1 diagram.",
+                                up="../", page="pyq", body=PYQ_BODY, scripts=scripts, **v))
     with open(os.path.join(ROOT, "index.html"), "w", encoding="utf-8") as f:
         f.write(PAGE.format(title="Home", desc="End-term revision for High Performance C++: notes, MCQs, MSQs, written and coding practice.",
                             up="", page="index", body=INDEX_BODY, scripts=f'<script src="data/site.js?v={v["v_site"]}"></script>', **v))

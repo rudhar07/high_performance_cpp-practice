@@ -111,10 +111,18 @@
   }
 
   // ---------- question renderers ----------
+  // Question text: full Markdown when it contains a code block, inline formatting otherwise.
+  function qhead(box, tag, text) {
+    if (/```/.test(text)) {
+      box.appendChild(el("h3", null, tag));
+      box.appendChild(el("div", { class: "qtext" }, md(text)));
+    } else box.appendChild(el("h3", null, `${tag}${inline(text)}`));
+  }
+
   function renderMcq(q, all, onChange, extraTag) {
     const box = el("section", { class: "q", id: q.id });
     const tag = extraTag ? `<span class="tag">${extraTag}</span>` : "";
-    box.appendChild(el("h3", null, `${tag}${inline(q.q)}`));
+    qhead(box, tag, q.q);
     const opts = el("div", { class: "options", role: "group" });
     const fb = el("div", { "aria-live": "polite" });
     const retry = el("button", { class: "btn", type: "button", style: "margin-top:10px" }, "Try again");
@@ -154,7 +162,7 @@
   function renderMsq(q, all, onChange, extraTag) {
     const box = el("section", { class: "q msq", id: q.id });
     const tag = extraTag ? `<span class="tag">${extraTag}</span>` : "";
-    box.appendChild(el("h3", null, `${tag}${inline(q.q)}`));
+    qhead(box, tag, q.q);
     box.appendChild(el("p", { class: "note msq-hint" }, "Select <b>all</b> correct options, then press Submit."));
     const opts = el("div", { class: "options", role: "group" });
     const fb = el("div", { "aria-live": "polite" });
@@ -259,6 +267,13 @@
          <div class="bar" aria-hidden="true"><i style="width:${Math.round(st.answered / st.total * 100)}%"></i></div>`));
     });
     const qgrid = document.getElementById("quiz-grid"); qgrid.innerHTML = "";
+    if (SITE.pyq) {
+      const st = stats(SITE.pyq.ids, all);
+      qgrid.appendChild(el("a", { class: "card" + (st.answered === st.total ? " done" : ""), href: SITE.pyq.file },
+        `<div class="num">Previous year paper</div><div class="title">End Term 2027 (PYQ)</div>
+         <div class="meta">${SITE.pyq.ids.length} MCQs/MSQs with official answers · 4 coding · 1 diagram${st.answered ? ` · <b>${st.correct}/${st.answered}</b> right` : ""}</div>
+         <div class="bar" aria-hidden="true"><i style="width:${Math.round(st.answered / SITE.pyq.ids.length * 100)}%"></i></div>`));
+    }
     if (SITE.coding) {
       const st = stats(SITE.coding.ids, all);
       qgrid.appendChild(el("a", { class: "card" + (st.answered && st.correct === st.total ? " done" : ""), href: SITE.coding.file },
@@ -451,6 +466,40 @@
       "</tbody></table></div>" : '<p class="sub">Coming soon.</p>';
   }
 
+  // ---------- previous year paper ----------
+  function renderSolved(q, label) {
+    const box = el("section", { class: "q lab problem", id: "P-" + q.n });
+    box.appendChild(el("h3", null, `<span class="tag">${esc(label)}</span>${esc(q.title)}`));
+    box.appendChild(el("div", { class: "statement" }, md(q.statement)));
+    if (q.starter) box.appendChild(el("details", { class: "model" }, `<summary>Starter code / signature (as given in the paper)</summary><pre>${esc(q.starter)}</pre>`));
+    if (q.solution) box.appendChild(el("details", { class: "model solution" },
+      `<summary>✅ Solution (compiled and tested)</summary><pre>${esc(q.solution)}</pre><div class="explain">${md(q.explanation || "")}</div>` +
+      (q.tests ? `<details class="model"><summary>Tests used</summary><pre>${esc(q.tests)}</pre></details>` : "")));
+    if (q.answer) box.appendChild(el("details", { class: "model solution" }, `<summary>✅ Model answer</summary><div class="explain">${md(q.answer)}</div>`));
+    if (q.ref) box.appendChild(el("p", { class: "note" }, "Revise: " + q.ref));
+    return box;
+  }
+  function drawPyq() {
+    const P = window.PAGE, all = loadAll();
+    const ids = P.mcqs.map(q => q.id);
+    const score = () => { const st = stats(ids, loadAll()); document.getElementById("score").innerHTML = `<span class="pill">${st.answered}/${st.total} answered · ${st.correct} right</span>`; };
+    const box = document.getElementById("pyq-mcqs"); box.innerHTML = "";
+    P.mcqs.forEach(q => box.appendChild(q.type === "msq" ? renderMsq(q, all, score, `Q${q.n} · select all`) : renderMcq(q, all, score, `Q${q.n}`)));
+    const cbox = document.getElementById("pyq-coding"); cbox.innerHTML = "";
+    P.coding.forEach(q => cbox.appendChild(renderSolved(q, `Q${q.n} · Coding`)));
+    const dbox = document.getElementById("pyq-diagram"); dbox.innerHTML = "";
+    dbox.appendChild(renderSolved(P.diagram, `Q${P.diagram.n} · Diagram`));
+    score();
+  }
+  function renderPyq() {
+    document.getElementById("pyq-format").textContent = window.PAGE.format;
+    drawPyq(); watch(drawPyq);
+    document.getElementById("reset").addEventListener("click", () => {
+      if (!confirm("Clear your answers for this paper?")) return;
+      const all = loadAll(); Object.keys(all).filter(k => /^PYQ-|^P-/.test(k)).forEach(k => delete all[k]); saveAll(all); drawPyq();
+    });
+  }
+
   // Redraw when answers changed elsewhere: back/forward cache, tab switch, another tab.
   function watch(draw) {
     const refresh = () => { const now = rawStore(); if (now !== seen) { seen = now; draw(); } };
@@ -473,5 +522,6 @@
     if (page === "lecture") renderLecture();
     if (page === "quiz") renderQuiz();
     if (page === "coding") renderCoding();
+    if (page === "pyq") renderPyq();
   });
 })();

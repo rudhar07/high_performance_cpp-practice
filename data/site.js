@@ -806,5 +806,35 @@ window.SITE = {
   ],
   "leetcode": 30,
   "other": 21
+ },
+ "pyq": {
+  "file": "pyq/index.html",
+  "ids": [
+   "PYQ-1",
+   "PYQ-2",
+   "PYQ-3",
+   "PYQ-4",
+   "PYQ-5",
+   "PYQ-6",
+   "PYQ-7",
+   "PYQ-8",
+   "PYQ-9",
+   "PYQ-10",
+   "PYQ-11",
+   "PYQ-12",
+   "PYQ-13",
+   "PYQ-14",
+   "PYQ-15",
+   "PYQ-16",
+   "PYQ-17",
+   "PYQ-18",
+   "PYQ-19",
+   "PYQ-20",
+   "PYQ-21",
+   "PYQ-22",
+   "PYQ-23",
+   "PYQ-24",
+   "PYQ-25"
+  ]
  }
 };

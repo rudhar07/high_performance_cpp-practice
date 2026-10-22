@@ -276,3 +276,7 @@ textarea.code { min-height: 320px; font-size: .86rem; tab-size: 4; }
 .option { min-width: 0; }
 .option > span:last-child { min-width: 0; overflow-wrap: anywhere; }
 .q h3, .feedback, .checks li span { overflow-wrap: anywhere; }
+.qtext { margin: -4px 0 12px; }
+.qtext p { margin: 4px 0; line-height: 1.55; font-weight: 600; }
+.qtext pre { margin: 6px 0; }
+.solution > summary { color: var(--ok); }
